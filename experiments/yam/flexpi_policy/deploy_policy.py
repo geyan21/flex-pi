@@ -3,8 +3,7 @@
 Sister of ``experiments/robotwin/flexpi_policy/deploy_policy.py``.
 
 This file targets the YAM real-world FlexPiUnifiedJoint model trained by
-``scripts/yam_unified_joint_0509_4xh200_5ep.slurm``. Differences vs. the
-RoboTwin deploy:
+``scripts/train_flexpi_yam.sh``. Differences vs. the RoboTwin deploy:
 
 - Camera keys in observations are ``cam_high / cam_left_wrist / cam_right_wrist``
   (canonical RoboTwin-rename layout — same names the training dataset on
@@ -611,7 +610,7 @@ class YamFlexPiPolicy:
 
         ``observation`` keys are documented on the class docstring. Missing
         ``depth`` is supported only if the model's ``infer_action`` signature
-        does NOT declare ``per_cam_depth`` — for the YAM 0509 model it does,
+        does NOT declare ``per_cam_depth`` — for the YAM unified-joint model it does,
         so depth is required.
 
         When ``return_latents=True`` the return shape changes from
@@ -631,7 +630,7 @@ class YamFlexPiPolicy:
             if "depth" not in observation or observation["depth"] is None:
                 raise ValueError(
                     "Model signature declares `per_cam_depth` but observation['depth'] is missing. "
-                    "The YAM unified-joint 0509 model requires per-camera depth at deploy."
+                    "The YAM unified-joint model requires per-camera depth at deploy."
                 )
             per_cam_depth = self._build_per_cam_depth(observation["depth"])
             K = observation.get("intrinsics")
@@ -680,8 +679,9 @@ class YamFlexPiPolicy:
             # generation). Only the recorder path (return_latents=True) needs
             # them. Mirrors experiments/robotwin/flexpi_policy/deploy_policy.py.
             infer_kwargs["return_stream_latents"] = bool(return_latents)
-        # Models trained with per-cam RGB (RobotVideoDataset → YAM
-        # 0509 falls in this bucket) accept per_cam alongside the composite.
+        # Models trained with per-cam RGB (RobotVideoDataset → the YAM
+        # unified-joint model falls in this bucket) accept per_cam alongside
+        # the composite.
         if "per_cam" in self._infer_sig:
             infer_kwargs["per_cam"] = per_cam_rgb
         if per_cam_depth is not None:
