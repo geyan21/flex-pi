@@ -35,9 +35,7 @@ dependencies = [
   "rich==14.2.0",
   "safetensors==0.5.3",
   "termcolor==2.5.0",
-  "torch==2.7.1+cu128",
   "torchcodec==0.5",
-  "torchvision==0.22.1+cu128",
   "tqdm==4.66.5",
   "timm==1.0.26",
   "transformers==4.49.0",
@@ -46,9 +44,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Backend extras are mutually exclusive because CUDA and XPU wheels provide
+# incompatible builds of the same packages.
+cuda = [
+  "torch==2.7.1+cu128",
+  "torchvision==0.22.1+cu128",
+]
+xpu = [
+  "torch==2.13.0+xpu",
+  "torchvision==0.28.0+xpu",
+]
+
 # LIBERO simulation. Install with:
 #
-#     pip install '.[libero]'
+#     pip install '.[libero,cuda]' --extra-index-url https://download.pytorch.org/whl/cu128
+#     pip install '.[libero,xpu]' --extra-index-url https://download.pytorch.org/whl/xpu
 #     pip install --no-deps robosuite==1.4.0
 #
 # robosuite is deliberately NOT listed here and MUST be installed with

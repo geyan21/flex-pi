@@ -1,7 +1,10 @@
 # Installation
 
-Linux x86_64, CUDA 12.8, Python 3.10. One 32 GB GPU runs inference, evaluation
-and deployment; training needs A100/H100/H200-class cards.
+Linux x86_64, Python 3.10. CUDA 12.8 and Intel XPU are supported for inference
+and evaluation. One 32 GB CUDA GPU runs inference, evaluation and deployment;
+training needs A100/H100/H200-class cards. XPU support targets Intel GPU
+inference and evaluation and does not cover the CUDA-only DeepSpeed training
+path.
 
 In order:
 
@@ -24,7 +27,7 @@ cannot share one, so build a second if you need both. Versions are pinned in
 conda create -n flexpi python=3.10 -y
 conda activate flexpi
 
-pip install -e . --extra-index-url https://download.pytorch.org/whl/cu128
+pip install -e '.[cuda]' --extra-index-url https://download.pytorch.org/whl/cu128
 
 # torchcodec from PyPI, not the cu128 index.
 pip install --force-reinstall --no-deps \
@@ -56,7 +59,7 @@ uv venv --python 3.10 .venv
 source .venv/bin/activate
 
 UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128 \
-  uv pip install --index-strategy unsafe-best-match -e .
+  uv pip install --index-strategy unsafe-best-match -e '.[cuda]'
 
 uv pip install --reinstall --no-deps \
   --index-url https://pypi.org/simple torchcodec==0.5
@@ -68,7 +71,56 @@ uv pip install -e '.[trt]'       # TensorRT serving
 FFmpeg 7 and `nvcc` are not pip packages — `uv` cannot supply either. Use the
 system package manager (and point `CUDA_HOME` at the toolkit) or the conda path.
 
-### 1c. Docker
+### 1c. Intel XPU
+
+Use the `xpu` extra in a separate environment from the `cuda` extra. Do not
+install both extras into the same environment: PyTorch CUDA and XPU wheels are
+mutually exclusive. The XPU path uses PyTorch `2.13.0+xpu` and torchvision
+`0.28.0+xpu` from the PyTorch XPU wheel index.
+
+#### conda
+
+```bash
+conda create -n flexpi-xpu python=3.10 -y
+conda activate flexpi-xpu
+
+pip install -e '.[xpu]' \
+  --extra-index-url https://download.pytorch.org/whl/xpu
+
+conda install -c conda-forge 'ffmpeg=7' -y
+```
+
+#### uv
+
+```bash
+uv venv --python 3.10 .venv-xpu
+source .venv-xpu/bin/activate
+
+UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/xpu \
+  uv pip install --index-strategy unsafe-best-match \
+  -e '.[xpu]'
+```
+
+FFmpeg 7 is still required by torchcodec and must be installed separately
+with conda or the system package manager. XPU does not use `nvcc`,
+`CUDA_HOME`, or the CUDA Docker image. The optional `[trt]` extra is CUDA-only.
+
+Verify the selected backend before loading a model:
+
+```bash
+python -c "import torch; print(torch.__version__); print('xpu:', torch.xpu.is_available()); print('cuda:', torch.cuda.is_available())"
+```
+
+For XPU inference or evaluation, pass `--device xpu` to the supported launcher.
+For example:
+
+```bash
+python scripts/inference_opt/benchmark_flex_latency.py \
+  --device xpu \
+  --ckpt /path/to/checkpoint
+```
+
+### 1d. Docker
 
 Save as `Dockerfile` at the repository root:
 
@@ -84,7 +136,7 @@ RUN conda install -y -c conda-forge 'ffmpeg=7' && conda clean -afy
 WORKDIR /workspace/flex-pi
 COPY pyproject.toml ./
 COPY src ./src
-RUN pip install --no-cache-dir -e . \
+RUN pip install --no-cache-dir -e '.[cuda]' \
       --extra-index-url https://download.pytorch.org/whl/cu128
 RUN pip install --no-cache-dir --force-reinstall --no-deps \
       --index-url https://pypi.org/simple torchcodec==0.5
@@ -101,6 +153,54 @@ docker run --gpus all -it --rm \
   -v "$PWD/checkpoints:/workspace/flex-pi/checkpoints" \
   -v "$PWD/data:/workspace/flex-pi/data" \
   flexpi:latest bash
+```
+
+#### Intel XPU
+
+XPU containers use an Intel oneAPI base image rather than the CUDA image above.
+The host must have a working Intel GPU driver and expose `/dev/dri` to the
+container. This path is for XPU inference and evaluation; the CUDA-only
+DeepSpeed training path is not supported in this image.
+
+Save as `Dockerfile.xpu` at the repository root:
+
+```dockerfile
+FROM intel/oneapi-basekit:2025.3.2-0-devel-ubuntu24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  git python3 python3-pip \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/flex-pi
+COPY pyproject.toml ./
+COPY src ./src
+RUN python3 -m pip install --no-cache-dir -e '.[xpu]' \
+  --extra-index-url https://download.pytorch.org/whl/xpu
+RUN python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+  --index-url https://pypi.org/simple torchcodec==0.5
+
+COPY . .
+ENV DIFFSYNTH_MODEL_BASE_PATH=/workspace/flex-pi/checkpoints
+ENV SYCL_CACHE_PERSISTENT=1
+```
+
+Build and run it with the Intel GPU device exposed:
+
+```bash
+docker build -f Dockerfile.xpu -t flexpi:xpu .
+
+docker run --rm -it --ipc=host --shm-size=16g \
+  --device=/dev/dri \
+  --group-add "$(getent group render | cut -d: -f3)" \
+  -v "$PWD/checkpoints:/workspace/flex-pi/checkpoints" \
+  -v "$PWD/data:/workspace/flex-pi/data" \
+  flexpi:xpu bash
+```
+
+Inside the container, verify XPU visibility before running an evaluation:
+
+```bash
+python3 -c "import torch; print(torch.__version__); print('xpu:', torch.xpu.is_available())"
 ```
 
 ### Environment variables
@@ -284,8 +384,11 @@ Both commands run from the repository root:
 export PYTHONNOUSERSITE=1        # a user-site copy otherwise shadows the env (§5)
 git submodule update --init third_party/LIBERO
 
-# The extra-index is still required: torch==2.7.1+cu128 is not on PyPI.
-pip install -e '.[libero]' --extra-index-url https://download.pytorch.org/whl/cu128
+# Choose exactly one backend extra. CUDA is shown first because it is the
+# default deployment target.
+pip install -e '.[libero,cuda]' --extra-index-url https://download.pytorch.org/whl/cu128
+# For Intel XPU environments, use this instead:
+# pip install -e '.[libero,xpu]' --extra-index-url https://download.pytorch.org/whl/xpu
 pip install --no-deps robosuite==1.4.0
 ```
 

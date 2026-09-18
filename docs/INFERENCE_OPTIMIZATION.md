@@ -68,7 +68,7 @@ export PYTHONNOUSERSITE=1   # or pip counts a ~/.local copy as already satisfied
 # torch pin, and an installed flexpi turns that into a pip conflict on every
 # later call. The exporters put src/ on sys.path themselves, so imports still
 # resolve.
-pip install -e . --extra-index-url https://download.pytorch.org/whl/cu128
+pip install -e '.[cuda]' --extra-index-url https://download.pytorch.org/whl/cu128
 pip uninstall -y flexpi
 
 # Then the torch the exporter needs. Pin both -- unpinned, torchvision
