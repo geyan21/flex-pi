@@ -52,6 +52,8 @@ CAMERA_INTRINSICS_PATH="${CAMERA_INTRINSICS_PATH:-${DATA_ROOT}/libero_object_no_
 
 # ── GPUs ──────────────────────────────────────────────────────────────────────
 GPUS="${GPUS:-0}"
+# Device passed to the model: cuda (default) or xpu (Intel GPU, torch 2.13.0+xpu).
+EVALUATION_DEVICE="${EVALUATION_DEVICE:-cuda}"
 IFS=',' read -r -a GPU_ARR <<< "$GPUS"
 NGPU=${#GPU_ARR[@]}
 
@@ -96,6 +98,7 @@ for gpu in "${GPU_ARR[@]}"; do
     task="${HYDRA_TASK_PRESET}" \
     ckpt="${CKPT}" \
     gpu_id="${gpu}" \
+    EVALUATION.device="${EVALUATION_DEVICE}" \
     EVALUATION.dataset_stats_path="${DATASET_STATS}" \
     "+EVALUATION.camera_intrinsics_path=${CAMERA_INTRINSICS_PATH}" \
     "+EVALUATION.tasks_file=${shard}" \

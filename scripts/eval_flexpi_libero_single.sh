@@ -41,6 +41,8 @@ TASK_ID="${TASK_ID:-0}"
 
 # ── GPU ───────────────────────────────────────────────────────────────────────
 GPU_ID="${GPU_ID:-0}"
+# Device passed to the model: cuda (default) or xpu (Intel GPU, torch 2.13.0+xpu).
+EVALUATION_DEVICE="${EVALUATION_DEVICE:-cuda}"
 
 # ── Output / data ─────────────────────────────────────────────────────────────
 OUTPUT_DIR="${OUTPUT_DIR:-./eval_results/libero_unified_flex_single_${TASK_SUITE_NAME}_t${TASK_ID}_$(date +%Y%m%d_%H%M%S)}"
@@ -73,6 +75,7 @@ CMD=(
     python experiments/libero/eval_libero_single.py
     task="${HYDRA_TASK_PRESET}"
     ckpt="${CKPT}"
+    EVALUATION.device="${EVALUATION_DEVICE}"
     EVALUATION.dataset_stats_path="${DATASET_STATS}"
     "+EVALUATION.camera_intrinsics_path=${CAMERA_INTRINSICS_PATH}"
     EVALUATION.output_dir="${OUTPUT_DIR}"

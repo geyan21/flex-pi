@@ -157,6 +157,7 @@ class PhaseTimer:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--device", default="cuda", help="cuda or xpu")
     ap.add_argument("--tag", default="")
     ap.add_argument("--joint-video", default=None)
     ap.add_argument("--joint-dino", default=None)
@@ -214,8 +215,18 @@ def main():
     ap.add_argument("--output", default=str(PROJECT_ROOT / "benchmark_results.jsonl"))
     args = ap.parse_args()
 
-    device = "cuda"
+    device = args.device
     dtype = torch.bfloat16
+    if device == "xpu":
+        sync = torch.xpu.synchronize
+        reset_mem = torch.xpu.reset_peak_memory_stats
+        peak_mem = torch.xpu.max_memory_allocated
+        dev_name = torch.xpu.get_device_name(0)
+    else:
+        sync = torch.cuda.synchronize
+        reset_mem = torch.cuda.reset_peak_memory_stats
+        peak_mem = torch.cuda.max_memory_allocated
+        dev_name = torch.cuda.get_device_name(0)
     ckpt_path = Path(args.ckpt).resolve()
     trained_cfg = OmegaConf.load(_find_trained_config(ckpt_path))
 
@@ -309,22 +320,22 @@ def main():
     t0 = time.perf_counter()
     with torch.no_grad():
         model.infer_action(**infer_kwargs)
-    torch.cuda.synchronize()
+    sync()
     first_call_s = time.perf_counter() - t0
     with torch.no_grad():
         for _ in range(max(0, args.warmup_iters - 1)):
             model.infer_action(**infer_kwargs)
-    torch.cuda.synchronize()
+    sync()
     timer.flush()
     timer.reset()
 
-    torch.cuda.reset_peak_memory_stats()
+    reset_mem()
     times, action_out = [], None
     with torch.no_grad():
         for _ in range(args.iters):
             t0 = time.perf_counter()
             out = model.infer_action(**infer_kwargs)
-            torch.cuda.synchronize()
+            sync()
             times.append((time.perf_counter() - t0) * 1e3)
             timer.flush()
             action_out = out["action"]
@@ -366,13 +377,13 @@ def main():
         "first_call_s": round(first_call_s, 1),
         "load_s": round(load_s, 1),
         "prepare_s": round(prepare_s, 1),
-        "peak_mem_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
+        "peak_mem_gb": round(peak_mem() / 1e9, 2),
         "phases_ms_per_call": timer.summary(n),
         # Fixed-seed action fingerprint: compare across configs to gauge
         # numerical drift (success-rate impact needs a real sim eval).
         "action_fingerprint": [round(float(v), 5) for v in action_out.flatten()[:8]],
         "action_absmean": round(float(action_out.abs().mean()), 5),
-        "gpu": torch.cuda.get_device_name(0),
+        "gpu": dev_name,
         "torch": torch.__version__,
     }
     with open(args.output, "a") as f:
