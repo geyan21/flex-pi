@@ -7,7 +7,7 @@ Deployed on an RTX 5090. ms/call at 4 denoise steps:
 | Stack | full joint | action only |
 |---|---:|---:|
 | eager PyTorch | 447 | 132 |
-| **torch.compile** — the default | 360 | **60** |
+| **torch.compile** — the default of the RoboTwin eval launchers | 360 | **60** |
 | **+ TensorRT joint engine** | 230 | — |
 | **+ TensorRT KV-split engines** | **193** | — |
 
@@ -152,6 +152,12 @@ a config does not port across unchanged:
 | `glue_cache` | ✓ | ✓, **but never with `--torch-compile`** — the pair hangs the boot, and the server rejects it |
 | single TRT engine | ✓ | **not exposed** — the server takes the KV-split pair only |
 | KV-split pair | ✓ | ✓ |
+
+**Why `glue_cache` and `torch.compile` do not mix on the joint path.** The glue
+memo is a dict on the model written inside the compiled step, so its first write
+fails Dynamo's guard and recompiles the frame: CUDA graphs then overwrite the
+memoized tensors, or the recompile looks like a hang. Without `--torch-compile`,
+as on the engine path, the memo runs eagerly.
 
 Other hard rules, all of which raise rather than silently misbehave: the single
 engine and the KV-split pair are mutually exclusive; `compile_encoders` and

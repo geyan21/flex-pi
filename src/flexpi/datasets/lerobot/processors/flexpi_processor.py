@@ -42,6 +42,7 @@ class FlexPiProcessor(BaseProcessor):
         tokenizer: Optional[Any] = None,
         delta_action_dim_mask: Optional[Dict[str, List[bool]]] = None,
         norm_skip_dims_mask: Optional[Dict[str, Dict[str, List[bool]]]] = None,
+        action_norm_clamp: Optional[float] = None,
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
@@ -66,6 +67,7 @@ class FlexPiProcessor(BaseProcessor):
         self.norm_default_mode = norm_default_mode
         self.norm_exception_mode = norm_exception_mode
         self.norm_skip_dims_mask = norm_skip_dims_mask
+        self.action_norm_clamp = action_norm_clamp
         self._normalizer = None
 
         self.tokenizer = tokenizer
@@ -83,7 +85,8 @@ class FlexPiProcessor(BaseProcessor):
             self.delta_action_dim_mask = {}
             for meta in action_meta:
                 key = meta["key"]
-                expected_dim = meta["raw_shape"]
+                # raw_shape may be a list of admissible widths; the mask is checked against the widest.
+                expected_dim = meta["raw_shape"] if isinstance(meta["raw_shape"], int) else max(meta["raw_shape"])
                 mask = delta_action_dim_mask[key]
                 if len(mask) != expected_dim:
                     raise ValueError(
@@ -119,6 +122,7 @@ class FlexPiProcessor(BaseProcessor):
             exception_mode=self.norm_exception_mode,
             stats=dataset_stats,
             skip_dims_mask=self.norm_skip_dims_mask,
+            action_clamp=self.action_norm_clamp,
         )
 
     def augment_instruction(self, data: Dict[str, str] | List[str]) -> List[str]:
@@ -151,17 +155,24 @@ class FlexPiProcessor(BaseProcessor):
         return instruction
 
     def action_state_transform(self, batch):
+        # `raw_shape` may be a LIST of admissible on-disk widths for
+        # mixed-embodiment corpora (e.g. [32, 34] for mm2/yam + AgiBot, where
+        # AlignTo34DByWidth unifies them); a plain int stays a strict check.
+        # The post-transform checks below are deliberately still single-width:
+        # whatever the chain admits, it must EMIT exactly `shape`.
         if "action" in batch:
             for meta in self.shape_meta["action"]:
                 k, meta_shape = meta["key"], meta["raw_shape"]
                 actual_shape = batch["action"][k].shape[-1]
-                assert actual_shape == meta_shape, \
+                allowed = (meta_shape,) if isinstance(meta_shape, int) else tuple(int(x) for x in meta_shape)
+                assert actual_shape in allowed, \
                     f"Action key {k} actual raw shape {actual_shape} mismatch with meta raw shape {meta_shape}."
-                    
+
         for meta in self.shape_meta["state"]:
             k, meta_shape = meta["key"], meta["raw_shape"]
             actual_shape = batch["state"][k].shape[-1]
-            assert actual_shape == meta_shape, \
+            allowed = (meta_shape,) if isinstance(meta_shape, int) else tuple(int(x) for x in meta_shape)
+            assert actual_shape in allowed, \
                 f"State key {k} actual raw shape {actual_shape} mismatch with meta raw shape {meta_shape}."
         
         if self.action_state_transforms is not None: 

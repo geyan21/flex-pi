@@ -1,0 +1,165 @@
+train:
+  # AgiBot 500hr pretrain, 34D relative layout: all 14 joint DoF kept.
+  #     [0:20]   EEF + grippers
+  #     [20:27]  L_joint (7 DoF)  <- disk[20:27]
+  #     [27:34]  R_joint (7 DoF)  <- disk[27:34]
+  # The 34D layout is the one a YAM run scatters into (yam34.yaml), so an
+  # AgiBot checkpoint's action head drops into a YAM finetune unchanged.
+  #
+  # Transform chain (forward, in order):
+  #   1. AgiBotAbsoluteLookahead(keep_all_joints=true)
+  #        34D disk -> 34D layout (col->row 6D rotation fix, nothing dropped);
+  #        one-frame shift action[k] := state[t+1+k] (AgiBot's disk action is
+  #        bit-equal to state on EEF/joint slots, so without the shift the
+  #        target would be the trajectory recording rather than where to go
+  #        next); grippers take the disk action's binary command.
+  #   2. Yam32DRelativeAction(anchor="first", state_dim=34)
+  #        state untouched (proprio stays absolute); EEF body-frame relative
+  #        to state[t]; joints as scalar delta from state[t]; grippers
+  #        pass-through. Same base for every step of the chunk.
+  # The result is action_target[k] = relative(state[t+1+k], state[t]), the
+  # same expression YAM's Yam32DRelativeAction produces from its own
+  # (already-lookahead) disk action.
+  #
+  # Backward is fully defined for this layout (Yam32DRelativeAction.backward,
+  # then AgiBotAbsoluteLookahead.backward), giving back an AgiBot disk-layout
+  # command with disk[26]/disk[33] recovered.
+  _target_: flexpi.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  depth_codec: ffv1
+  dataset_dirs:
+    - ./data/agibot_lerobot_500hr/my_task
+  dataset_weights: null
+  samples_per_epoch: null
+  shape_meta:
+    images:
+      - key: cam_high
+        raw_shape: [3, 480, 640]
+        shape: [3, 256, 320]
+      - key: cam_left_wrist
+        raw_shape: [3, 480, 640]
+        shape: [3, 256, 320]
+      - key: cam_right_wrist
+        raw_shape: [3, 480, 640]
+        shape: [3, 256, 320]
+    depth:
+      - key: cam_high
+        raw_shape: [1, 480, 640]
+        shape: [1, 256, 320]
+      - key: cam_left_wrist
+        raw_shape: [1, 480, 640]
+        shape: [1, 224, 224]
+      - key: cam_right_wrist
+        raw_shape: [1, 480, 640]
+        shape: [1, 224, 224]
+    action:
+      # 34D disk -> 34D layout: a pure re-layout, nothing dropped; the
+      # relative transform changes the content, not the width.
+      - key: default
+        raw_shape: 34
+        shape: 34
+    state:
+      - key: default
+        raw_shape: 34
+        shape: 34
+  num_frames: 33
+  global_sample_stride: 1
+  action_video_freq_ratio: 4
+  video_size: [384, 320]
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  pretrained_norm_stats: null              # fit from the training data on the first run
+  skip_padding_as_possible: false
+  concat_multi_camera: "tshape_384x320"
+  processor:
+    _target_: flexpi.datasets.lerobot.processors.flexpi_processor.FlexPiProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 3
+    action_output_dim: 34
+    proprio_output_dim: 34
+
+    # Applied forward in list order, backward in reversed order.
+    action_state_transforms:
+      - _target_: flexpi.datasets.lerobot.transforms.absolute_pose_lookahead.AgiBotAbsoluteLookahead
+        keep_all_joints: true
+      - _target_: flexpi.datasets.lerobot.transforms.yam_relative_action.Yam32DRelativeAction
+        anchor: "first"
+        state_dim: 34
+
+    # False, as in every preset on this tree: one global q01/q99 pair per dim
+    # over the 32 steps. (The lookahead takes the k=0 target from state[t+1],
+    # so the k=0 joint deltas are not zero.)
+    use_stepwise_action_norm: False
+    norm_default_mode: q01/q99
+    norm_exception_mode: null
+
+    # Identity scatter: all 34 slots used (AgiBot dual-arm fills everything).
+    action_state_merger:
+      _target_: flexpi.datasets.lerobot.transforms.action_state_merger.ScatterToChannels
+      total_dim: 34
+
+    # 34-wide. rot6d slots [3:9] and [12:18] pass through unnormalized — SO(3)
+    # is restored by Gram-Schmidt at decode time, not by bounds.
+    # Slot semantics after the chain:
+    #   0-2,9-11   L_pos, R_pos      : body-frame relative (delta-from-base)
+    #   3-8,12-17  L_rot6d, R_rot6d  : body-frame relative SE(3) rotation, identity-normalized
+    #   18,19      L_grip, R_grip    : binary command (passthrough)
+    #   20-26      L_joint (7 DoF)   : scalar delta from base
+    #   27-33      R_joint (7 DoF)   : scalar delta from base
+    norm_skip_dims_mask:
+      action:
+        default:
+          [false, false, false,                                  # 0-2   L_pos     (rel)
+           true,  true,  true,  true,  true,  true,              # 3-8   L_rot6d   (identity)
+           false, false, false,                                  # 9-11  R_pos     (rel)
+           true,  true,  true,  true,  true,  true,              # 12-17 R_rot6d   (identity)
+           false,                                                # 18    L_grip    (binary cmd)
+           false,                                                # 19    R_grip    (binary cmd)
+           false, false, false, false, false, false, false,      # 20-26 L_joint 1-7 (delta)
+           false, false, false, false, false, false, false]      # 27-33 R_joint 1-7 (delta)
+      state:
+        default:
+          [false, false, false,
+           true,  true,  true,  true,  true,  true,
+           false, false, false,
+           true,  true,  true,  true,  true,  true,
+           false,
+           false,
+           false, false, false, false, false, false, false,
+           false, false, false, false, false, false, false]
+
+    # Both transforms handle chunk boundaries themselves (the lookahead pads
+    # with state[T_obs-1]; anchor="first" uses one base for the whole chunk),
+    # so the rotvec/delta-path pad-zeroing is off.
+    delta_action_dim_mask: null
+
+    train_transforms:
+      - _target_: flexpi.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [256, 320]
+    val_transforms:
+      - _target_: flexpi.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [256, 320]
+  text_embedding_cache_dir: ./data/text_embeds_cache/agibot_500hr
+  context_len: 128
+
+val:
+  _target_: ${data.train._target_}
+  depth_codec: ${data.train.depth_codec}
+  dataset_dirs: ${data.train.dataset_dirs}
+  shape_meta: ${data.train.shape_meta}
+  num_frames: ${data.train.num_frames}
+  global_sample_stride: ${data.train.global_sample_stride}
+  action_video_freq_ratio: ${data.train.action_video_freq_ratio}
+  video_size: ${data.train.video_size}
+  camera_key: ${data.train.camera_key}
+  val_set_proportion: ${data.train.val_set_proportion}
+  is_training_set: false
+  pretrained_norm_stats: null               # runtime fills from work_dir/dataset_stats.json
+  skip_padding_as_possible: ${data.train.skip_padding_as_possible}
+  concat_multi_camera: ${data.train.concat_multi_camera}
+  processor: ${data.train.processor}        # Hydra instantiates a fresh processor; .eval() set by trainer
+  text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+  context_len: ${data.train.context_len}

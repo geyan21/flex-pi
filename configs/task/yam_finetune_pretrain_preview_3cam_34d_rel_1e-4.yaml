@@ -1,0 +1,49 @@
+# @package _global_
+#
+# FlexPi (flex_joint) — YAM fine-tune from flex-pi/flexpi-pretrain-preview (RGB +
+# optional depth/pointmap, 34D head with pad slots 26/33). The data chain is
+# yam_unified_flex_3cam_34d_rel_1e-4's (yam34: Yam32DRelativeAction, 32-wide
+# normalizer, 32 -> 34 scatter); the model block and the norm stats follow
+# the checkpoint:
+#   - the checkpoint's frame-pooled q01/q99 stats in their 32-wide form
+#     (dataset_stats_rel32.json in the download: slots 26/33 dropped), since
+#     yam34 normalizes before the scatter;
+#   - action targets unclamped (action_norm_clamp .inf), as the checkpoint
+#     trained them under those stats;
+#   - DINO temporal stride 1, MoT gradient checkpointing on.
+# The warm start loads strictly: a shape mismatch is an error rather than a
+# silent re-init. The default pretrained_ckpt is the download location in
+# docs/FINETUNE.md. See docs/FINETUNE.md.
+
+defaults:
+  - override /data: yam34
+  - override /model: flexpi
+  - _self_
+
+batch_size: 9
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: true
+  dino_temporal_stride: 1
+  dino_stride_keep_far: false
+
+data:
+  train:
+    concat_multi_camera: ${model.composite_layout}
+    pretrained_norm_stats: ./checkpoints/flexpi-pretrain-preview/dataset_stats_rel32.json
+    processor:
+      action_norm_clamp: .inf
+
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 2
+save_every: 1000
+eval_every: 1000
+
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+pretrained_ckpt: ./checkpoints/flexpi-pretrain-preview/checkpoints/weights/step_190000.pt
+pretrained_ckpt_strict_shape: true

@@ -85,6 +85,17 @@ NUM_EPISODES_PER_TASK=100 bash scripts/train_flexpi_robotwin.sh
 The sample is seeded, and the count is stamped into the output directory name
 (`all_perTask100_epoch6`).
 
+### LoRA fine-tuning of the released checkpoint
+
+`robotwin_lora_release_3cam_384_3e-4` fine-tunes
+[`flex-pi/flexpi-robotwin`](https://huggingface.co/flex-pi/flexpi-robotwin) with
+LoRA on one GPU ([`TRAINING.md §7`](TRAINING.md#7-lora-fine-tuning)):
+
+```bash
+CUDA_DEVICES=0 NPROC_PER_NODE=1 TASK_NAMES=hanging_mug \
+TASK_CONFIG=robotwin_lora_release_3cam_384_3e-4 bash scripts/train_flexpi_robotwin.sh
+```
+
 ### Outputs
 
 ```

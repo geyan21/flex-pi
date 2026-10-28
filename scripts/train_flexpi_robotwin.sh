@@ -26,7 +26,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 TASK_CONFIG="${TASK_CONFIG:-robotwin_unified_flex_3cam_384_1e-4}"
-TASK_NAMES="all"                                     # "all", or a space-separated subset
+TASK_NAMES="${TASK_NAMES:-all}"                      # "all", or a space-separated subset
 NUM_EPISODES_PER_TASK="${NUM_EPISODES_PER_TASK:-}"   # e.g. 50/100 for the demo-efficiency sweep; empty = all
 NUM_EPISODES=""
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
@@ -95,7 +95,8 @@ EXTRA_ARGS=(
 [[ -n "${NUM_EPISODES}" ]] && EXTRA_ARGS+=("+data.train.num_episodes=${NUM_EPISODES}")
 [[ -n "${NUM_EPOCHS}" ]]   && EXTRA_ARGS+=("num_epochs=${NUM_EPOCHS}")
 [[ -n "${VAL_SET_PROPORTION}" ]] && EXTRA_ARGS+=("data.train.val_set_proportion=${VAL_SET_PROPORTION}")
-[[ -n "${RESUME}" ]]       && EXTRA_ARGS+=("resume=${RESUME}")
+# A resume restores the run itself, so a preset's own pretrained_ckpt must not apply too.
+[[ -n "${RESUME}" ]]       && EXTRA_ARGS+=("resume=${RESUME}" "pretrained_ckpt=null")
 [[ -n "${DATASET_WEIGHTS}" ]]   && EXTRA_ARGS+=("++data.train.dataset_weights=${DATASET_WEIGHTS}")
 [[ -n "${SAMPLES_PER_EPOCH}" ]] && EXTRA_ARGS+=("++data.train.samples_per_epoch=${SAMPLES_PER_EPOCH}")
 if [[ -n "${TASK_NAMES}" ]]; then

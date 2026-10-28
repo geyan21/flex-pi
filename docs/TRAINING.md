@@ -13,6 +13,8 @@ environment is [`INSTALL.md`](INSTALL.md); the per-benchmark recipes are
 - [3. The flex knobs](#3-the-flex-knobs)
 - [4. Finetune vs Resume](#4-finetune-vs-resume)
 - [5. Troubleshooting](#5-troubleshooting)
+- [6. DeepSpeed](#6-deepspeed)
+- [7. LoRA fine-tuning](#7-lora-fine-tuning)
 
 ---
 
@@ -40,8 +42,9 @@ Hydra override and wins over all three files:
 bash scripts/train_flexpi_libero.sh batch_size=4 num_epochs=10
 ```
 
-The three shipped task configs are one per setting; each benchmark doc names its
-own.
+The shipped task configs are one per setting (each benchmark doc names its own),
+plus the 34-D presets of [`MIXED_EMBODIMENT_34D.md`](MIXED_EMBODIMENT_34D.md) and
+the two preview fine-tune presets of [`FINETUNE.md`](FINETUNE.md).
 
 ---
 
@@ -68,7 +71,8 @@ keys** and, for the 3D stream, **depth videos + camera intrinsics**:
 │   ├── info.json
 │   ├── episodes.jsonl
 │   ├── tasks.jsonl                       # language instructions (used by text-embed precompute)
-│   └── camera_intrinsics.json            # REQUIRED for the pointmap/3D stream
+│   ├── camera_intrinsics.json            # REQUIRED for the pointmap/3D stream
+│   └── episode_intrinsics.jsonl          # OPTIONAL: one K per episode (see below)
 └── videos/chunk-000/
     ├── observation.images.cam_high/        episode_000000.mp4 ...
     ├── observation.images.cam_left_wrist/  ...
@@ -88,6 +92,21 @@ The loader looks for exactly those keys, and the pointmap stream needs
 `meta/camera_intrinsics.json` beside them. How both are produced — the raw layout
 in, the LeRobot layout out, and the intrinsics convention — is the dataset builder:
 [`YAM.md` step 1](YAM.md#1-data-build).
+
+#### Per-episode intrinsics
+
+`camera_intrinsics.json` holds one K per camera for the whole dataset, averaged
+by the builder, which mis-scales the pointmap of a capture spanning rigs with
+different optics. When a dataset carries `meta/episode_intrinsics.jsonl`, the
+loader uses each episode's own K instead. One JSON object per line:
+
+```json
+{"episode_index": 0, "intrinsics": {"cam_high": {"fx": 434.0, "fy": 434.0, "cx": 320.0, "cy": 240.0, "width": 640, "height": 480}, "cam_left_wrist": {...}, "cam_right_wrist": {...}}}
+```
+
+Same units, grid and endpoint rescale as `camera_intrinsics.json`, which stays
+required. The YAM builder writes the file; datasets without it use the averaged K.
+An episode missing from the table is an error.
 
 > **All datasets you combine must share the same fps, camera layout, and action
 > dimensionality.** This is enforced at runtime — an fps mismatch raises.
@@ -142,8 +161,8 @@ bash scripts/train_flexpi_yam.sh batch_size=3
 **Not every knob reads the environment, and which ones do differs per launcher.**
 A line written `VAR=value` is in-script only — exporting it does nothing. A line
 written `VAR="${VAR:-value}"` honours an export. Every `FLEX_P_*` is in-script in
-all three launchers, and `TASK_NAMES` is in-script in the RoboTwin one. Check the
-launcher before relying on `export`.
+the LIBERO and RoboTwin launchers and read from the environment by the YAM one
+(§3). Check the launcher before relying on `export`.
 
 The path that always works is a **Hydra override on the command line** — every
 launcher appends `"$@"` last, so a CLI value beats whatever the script set:
@@ -156,6 +175,17 @@ All three launch through `accelerate` with
 `scripts/accelerate_configs/accelerate_zero1_ds.yaml`; `ACCELERATE_CONFIG` points
 them at one of the others in that directory (ZeRO-2, DDP, single-GPU, ZeRO-0).
 
+**Action normalization clamp.** In `q01/q99` mode the normalizer clamps action
+targets to ±1 (±5 in `z-score`). The processor key `action_norm_clamp` sets
+another bound; `.inf` (in YAML; `++data.train.processor.action_norm_clamp=inf`
+on the command line) leaves targets unclamped, as frame-pooled stats are
+trained. State keeps the default clamp.
+
+**Action pad mask.** A data preset whose merger leaves channels empty passes them
+to the loss as masked only with `emit_action_dim_is_pad: true` (set by `yam34`);
+presets without it train on every channel
+([`MIXED_EMBODIMENT_34D.md`](MIXED_EMBODIMENT_34D.md)).
+
 ---
 
 ## 3. The flex knobs
@@ -164,9 +194,12 @@ Every training step, each stream is independently sampled as **present or absent
 each present stream is independently sampled as **jointly fused or not**. This is what lets
 one checkpoint serve all 8 regimes.
 
-The `FLEX_P_*` knobs are plain config-block assignments in all three launchers — edit
-the file; `export` does not reach them. `robotwin.sh` and `yam.sh` ship the `0.5`
-defaults below; `libero.sh` ships all six at `1.0`.
+The `FLEX_P_*` knobs are plain config-block assignments in `robotwin.sh` and
+`libero.sh` — edit the file; `export` does not reach them. `robotwin.sh` ships the
+`0.5` defaults below; `libero.sh` ships all six at `1.0`. `yam.sh` reads each from
+the environment and overrides only those that are set; unset, the task preset's
+`flex_joint` value applies (the `0.5` below, except the RGB-only fine-tune preset,
+whose pointmap probabilities are 0).
 
 | Knob | Default | Meaning |
 |------|---------|---------|
@@ -229,6 +262,12 @@ RESUME=/path/to/run/state/step_030000 bash scripts/train_flexpi_robotwin.sh
 `dino_pixel_unshuffle` all count, so a warm start has to match the donor's
 geometry rather than today's default.
 
+A weights file records `action_dim_mask_trained`, whether that run trained with
+the pad mask; deploy arms the mask from it, and a payload without the key falls
+back to the saved `config.yaml`'s `emit_action_dim_is_pad`. Under DeepSpeed a warm start took when
+the log carries `Re-seeded DeepSpeed fp32 master params after warm-init` ([§6](#6-deepspeed)).
+Warm-starting from the preview checkpoints is [`FINETUNE.md`](FINETUNE.md).
+
 ---
 
 ## 5. Troubleshooting
@@ -245,3 +284,93 @@ geometry rather than today's default.
 | `Missing text embedding cache: <hash>.t5_len128...pt` | re-run `precompute_text_embeds.py` with the **same** `data.train.dataset_dirs` you train on. Narrowing `TASK_NAMES` for training does **not** narrow the cache it needs — the prompt is looked up by hash, so every instruction your episodes carry must have been encoded. |
 | `Checkpoint was saved with pointmap_mode=...` / `disable_video_stream=True ... refusing to load` | an ablation-only mode that no longer exists; no migration path — retrain |
 | `TypeError: __init__() got an unexpected keyword argument 'dino_temporal_stride'` | you pointed a tool at a **saved run** `config.yaml`. Saved configs carry loader keys the merged `RobotVideoDataset` dropped. Eval never instantiates the dataset, so compose a fresh config instead (`task=...`). |
+| `model._target_ is '…', not a flexpi target`, or `ModuleNotFoundError` on a `_target_` of a saved `config.yaml` | the `config.yaml` was saved by the pre-release codebase; the released checkpoints ship one written for this tree |
+| `action_dim_is_pad width N != action head width M` | the `data.train.processor` and `model` blocks of a `config.yaml` come from different runs |
+
+---
+
+## 6. DeepSpeed
+
+All three launchers run DeepSpeed ZeRO-1 through `accelerate`
+(`scripts/accelerate_configs/accelerate_zero1_ds.yaml`).
+
+- **Warm-start re-seed.** ZeRO clones its fp32 master copy inside `prepare()`, so
+  weights loaded afterwards were reverted at the first optimizer step. The trainer
+  now re-seeds the master after every post-`prepare()` load (`PRETRAINED_CKPT`
+  and a weights-only `RESUME=<file>.pt`) and logs
+  `Re-seeded DeepSpeed fp32 master params after warm-init (...)`. A canary logs
+  `WARM_INIT_CANARY_FAILED` if the weights drift more than 3 % at step 1; it only
+  warns. A full-state `RESUME=<state dir>` restores the master itself.
+- **`max_grad_norm`.** It was inert under DeepSpeed in the initial public release.
+  The trainer now passes it to DeepSpeed's `gradient_clipping`; the default is
+  `null` (no clipping, which is what DeepSpeed runs always did), and any positive
+  value clips on every backend. Under the DDP and single-GPU accelerate configs
+  the old default of 1.0 did clip; `max_grad_norm=1.0` restores it.
+- **Gradient accumulation.** Under DeepSpeed the loss is divided by
+  `gradient_accumulation_steps` at the backward call, so `train/grad_norm` is no
+  longer inflated by the accumulation factor.
+
+---
+
+## 7. LoRA fine-tuning
+
+`lora.enabled=true` (the `lora:` block of `configs/train.yaml`) fine-tunes a
+trained checkpoint through low-rank adapters instead of its MoT weights. The MoT
+(both experts) is frozen; adapters (`W x + (alpha / rank) · B A x`, `B` zero at the
+start) sit on the Linears `lora.target_modules` names, by default the self- and
+cross-attention q, k, v, o and both FFN Linears of every block of both experts,
+and the parameters `lora.full_train` names (each expert's input and output layers)
+train at full rank. Outside the MoT nothing changes from a full fine-tune. At rank
+16 that is 68 M trainable parameters on the RoboTwin release geometry and 81-82 M
+on the YAM presets, against about 6.03 B and 6.04 B for a full fine-tune.
+
+- **Start.** A LoRA run needs `pretrained_ckpt` or `RESUME`. The checkpoint loads
+  into the model before the adapters attach and before `accelerator.prepare()`;
+  a frozen tensor missing from it, unexpected, or of another shape is an error.
+  The boot log reads `LoRA: loading the frozen base before attaching adapters`,
+  `LoRA attached: rank=16 ...` and `LoRA: trainable ...`. A full-state `RESUME`
+  refuses a `lora` block other than the run's.
+- **Saves.** `checkpoints/weights/step_N.pt` holds the adapters merged into the
+  base, the same payload as a full fine-tune's, which evaluation and the servers
+  load unchanged. Each save logs the share of the adapters' change that the bf16
+  weights keep (`change kept by the bf16 weights`), about 0.15 after a few steps
+  and above 0.99 after a few hundred. `checkpoints/lora/step_N.pt` holds the
+  adapters and the other trainable tensors (`flexpi.models.lora.load_adapter`
+  attaches them to their base), and `checkpoints/state/step_N/` the full state.
+- **Backends.** DeepSpeed ZeRO-1, the launchers' default, on one GPU or several.
+
+**Memory and speed** on one A100-80GB, DeepSpeed ZeRO-1 in one process:
+
+| preset | batch × accumulation | MoT checkpointing | peak allocated | s per sample |
+|---|---|---|---|---|
+| `robotwin_lora_release_3cam_384_3e-4` | 1 × 32 | on | 18.8 GiB | 0.97 |
+| same | 4 × 8 | off | 56.4 GiB | 0.42 |
+| `yam_finetune_pretrain_preview_3cam_34d_rel_1e-4` + `lora.enabled=true` | 1 × 8 | on | 17.7 GiB | 0.92 |
+| `yam_finetune_pretrain_rgb_preview_3cam_34d_rel_1e-4` + `lora.enabled=true` | 1 × 8 | on | 16.1 GiB | 0.88 |
+
+The batch-1 rows ran with the allocator capped at 22 GiB, as on a 24 GB card,
+through an in-training eval and a save; `nvidia-smi` reads about 1.4 GiB more
+(CUDA context).
+
+**RoboTwin.** `robotwin_lora_release_3cam_384_3e-4` fine-tunes the released
+[`flex-pi/flexpi-robotwin`](https://huggingface.co/flex-pi/flexpi-robotwin)
+(downloaded to `runs/flexpi-robotwin`, as in the README) on one GPU, in that
+checkpoint's geometry (`composite_layout: null`, `dino_pixel_unshuffle: 0`,
+`dino_pred_x0: false`, `dino_stride_keep_far: false`); a warm start through
+`robotwin_unified_flex_3cam_384_1e-4` re-initializes its DINO heads.
+`TASK_NAMES` picks the tasks:
+
+```bash
+CUDA_DEVICES=0 NPROC_PER_NODE=1 TASK_NAMES=hanging_mug \
+TASK_CONFIG=robotwin_lora_release_3cam_384_3e-4 bash scripts/train_flexpi_robotwin.sh
+```
+
+**YAM.** On the fine-tune presets of [`FINETUNE.md`](FINETUNE.md) the block is a
+Hydra override:
+
+```bash
+CUDA_DEVICES=0 NPROC_PER_NODE=1 TASK_CONFIG=yam_finetune_pretrain_preview_3cam_34d_rel_1e-4 \
+DATASET_DIRS="[./data/yam/my_task]" bash scripts/train_flexpi_yam.sh \
+  lora.enabled=true batch_size=1 gradient_accumulation_steps=32 model.mot_checkpoint_mixed_attn=true
+```
+

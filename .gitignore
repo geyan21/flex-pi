@@ -249,7 +249,6 @@ eval_results/
 release_libero_ckpts/
 
 # Local reference clones (each has its own .git; not part of this repo)
-third_party/FastWAM/
 
 
 # NFS silly-rename temp files.
@@ -278,3 +277,6 @@ eval_out/
 
 # Machine-specific eval wrapper (scripts/local_run.sh) — dev box only, never released.
 scripts/local_*.sh
+
+# git worktrees checked out under the repo (per-branch working copies)
+.worktrees/

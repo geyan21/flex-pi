@@ -17,14 +17,32 @@ from PIL import Image
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
+from .models.lora import (
+    LORA_SUFFIXES,
+    LoRASpec,
+    adapter_payload,
+    apply_lora_trainability,
+    assert_base_loaded,
+    inject_lora,
+    trainable_summary,
+)
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler, WeightedResumableEpochSampler
-from .utils.video_io import save_mp4
+from .utils.video_io import add_caption_band, save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
 logger = get_logger(__name__)
+
+
+def _optimizer_chain_names(opt):
+    """Type names of an optimizer wrapper chain, outermost first (cycle-safe)."""
+    names, seen = [], set()
+    while opt is not None and id(opt) not in seen:
+        seen.add(id(opt)); names.append(type(opt).__name__)
+        opt = getattr(opt, "optimizer", None)
+    return names
 
 
 class Wan22Trainer:
@@ -54,13 +72,28 @@ class Wan22Trainer:
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
         self.eval_every = int(cfg.eval_every)
+        # Every N steps, dump the GT clip of the current train batch (data as
+        # fed to the model, no inference) to eval_dir + wandb data/train_video:
+        # a visual probe that the loader draws diverse data. Independent of
+        # log_every (scalars). 0 disables.
+        self.train_video_log_every = int(getattr(cfg, "train_video_log_every", 500))
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         # When False, intermediate eval skips the expensive main video rollout
         # (model.infer) + VAE-recon viz + mp4, keeping val-loss. Lean eval for
         # FlexPi's no-test-time-video deployment. Default True = full eval.
         self.eval_video = bool(getattr(cfg, "eval_video", True))
+        # Independent val draws averaged per eval. evaluate() draws ONE val
+        # window per rank, so a single call estimates every metric from
+        # world_size samples; at 32 samples the per-point noise on eval
+        # action_l1 was measured at 8.3% of the mean against a ~2.6%
+        # improvement per 500-step interval, so the metric could not resolve
+        # its own trend. Noise falls as sqrt(k); cost is k x the eval.
+        # 1 = a single draw, the previous behaviour exactly.
+        self.eval_action_samples = max(1, int(getattr(cfg, "eval_action_samples", 1)))
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
-        self.max_grad_norm = float(cfg.max_grad_norm)
+        # null is how this config spells "off" (cf. max_steps, resume,
+        # pretrained_ckpt); 0.0 still means the same thing.
+        self.max_grad_norm = float(cfg.max_grad_norm or 0.0)
         self.seed = int(cfg.seed)
         
         self.resume = cfg.resume
@@ -99,7 +132,7 @@ class Wan22Trainer:
             if ds_plugin is not None else "N/A"
         )
         logger.info(
-            "Accelerate training: distributed_type=%s zero_stage=%s world_size=%d process_index=%d cfg_mixed_precision=%s accelerator_mixed_precision=%s grad_accum=%d grad_clip=%.4f",
+            "Accelerate training: distributed_type=%s zero_stage=%s world_size=%d process_index=%d cfg_mixed_precision=%s accelerator_mixed_precision=%s grad_accum=%d grad_clip=%.4f%s",
             self.accelerator.distributed_type,
             zero_stage,
             self.accelerator.num_processes,
@@ -108,6 +141,7 @@ class Wan22Trainer:
             self.accelerator.mixed_precision,
             self.gradient_accumulation_steps,
             self.max_grad_norm,
+            "" if self.max_grad_norm > 0 else " (disabled)",
         )
         logger.info("using accelerator.device=%s", self.accelerator.device)
         worker_init_fn = set_global_seed(self.seed, get_worker_init_fn=True)
@@ -115,9 +149,18 @@ class Wan22Trainer:
         if self.val_dataset is not None:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
 
+        # LoRA (cfg.lora.enabled): the frozen base is warm-started and the
+        # adapters attached here, before the freeze, the optimizer and prepare().
+        self.lora_spec = LoRASpec.from_cfg(getattr(cfg, "lora", None))
+        self._lora_base_ckpt = None
+        if self.lora_spec is not None:
+            self._prepare_lora_model()
+
         # Freeze non-trainable modules (VAE, text encoder) before optimizer/deepspeed initialization.
         # _apply_dit_only_train_mode unfreezes dit + any model-specific trainable layers.
         self._apply_dit_only_train_mode(self.model)
+        if self.lora_spec is not None:
+            logger.info("LoRA: %s", trainable_summary(self.model))
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = self._build_optimizer(trainable_params)
         
@@ -141,6 +184,10 @@ class Wan22Trainer:
         self.checkpoint_root = os.path.join(self.output_dir, "checkpoints")
         self.weights_dir = os.path.join(self.checkpoint_root, "weights")
         self.state_dir = os.path.join(self.checkpoint_root, "state")
+        # Adapter-only files of a LoRA run. Not under weights/: that directory
+        # is globbed for step_*.pt (auto-pick, pruning) and must hold only
+        # loadable merged payloads.
+        self.lora_dir = os.path.join(self.checkpoint_root, "lora")
         self.eval_dir = os.path.join(self.output_dir, "eval")
 
         ensure_dir(self.output_dir)
@@ -148,7 +195,15 @@ class Wan22Trainer:
         ensure_dir(self.weights_dir)
         ensure_dir(self.state_dir)
         ensure_dir(self.eval_dir)
+        if self.lora_spec is not None:
+            ensure_dir(self.lora_dir)
 
+        # The only lever that clips under DeepSpeed: accelerate's clip_grad_norm_
+        # does not, and engine.step() is what consumes this key — so it must
+        # precede prepare(). 0.0 disables, which is what every DeepSpeed launch has
+        # always done (docs/TRAINING.md §6).
+        if ds_plugin is not None:
+            ds_plugin.deepspeed_config["gradient_clipping"] = max(self.max_grad_norm, 0.0)
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, self.train_loader, self.scheduler
         )
@@ -156,10 +211,38 @@ class Wan22Trainer:
 
         self.wandb_run = None
         self._init_wandb()
+        self._canary = None  # armed by a post-prepare weight load; checked after step 1
         self._resume_or_load_checkpoint()
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
         logger.info("Train/val dataset size: %d/%d", len(self.train_dataset), val_size)
+
+    def _prepare_lora_model(self):
+        """Warm-start the stock model, then attach the adapters.
+
+        The base checkpoint loads before any adapter exists and before
+        prepare(): the stock model takes the stock payload by name, and the
+        frozen base is never part of DeepSpeed's fp32 master copy, so nothing
+        can revert it (the trainable heads are loaded before the master copy is
+        cloned, too). assert_base_loaded makes a frozen tensor that did not come
+        from the checkpoint an error. A full-state resume attaches the adapters
+        to the fresh model and lets accelerator.load_state restore base and
+        adapters together.
+        """
+        if not (self.pretrained_ckpt or self.resume):
+            raise ValueError(
+                "lora.enabled=true needs pretrained_ckpt (or resume): the adapters train "
+                "against a frozen base, and the Wan2.2 / ActionDiT init is not a trained FlexPi."
+            )
+        if self.pretrained_ckpt:
+            pt_path = self._resolve_pretrained_ckpt_path(self.pretrained_ckpt)
+            logger.info("LoRA: loading the frozen base before attaching adapters: %s", pt_path)
+            payload = self.model.load_checkpoint(
+                str(pt_path), optimizer=None, strict_shape=self.pretrained_ckpt_strict_shape,
+            )
+            assert_base_loaded(self.model, payload, self.lora_spec)
+            self._lora_base_ckpt = str(Path(pt_path).resolve())
+        inject_lora(self.model, self.lora_spec, seed=self.seed)
 
     def _build_optimizer(self, trainable_params):
         adam_betas = tuple(getattr(self.cfg, "adam_betas", [0.9, 0.95]))
@@ -346,13 +429,22 @@ class Wan22Trainer:
             if not resume_path.exists():
                 raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
             logger.info("Loading weight checkpoint only: %s", resume)
-            self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
+            payload = self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
+            if getattr(self, "lora_spec", None) is not None:
+                # Merged weights into the base; the adapters restart from zero.
+                assert_base_loaded(self.accelerator.unwrap_model(self.model), payload, self.lora_spec)
+                self._lora_base_ckpt = str(resume_path.resolve())
+            self._reseed_deepspeed_master_params("weights-only resume")
+            self._warminit_canary_arm("weights-only resume")
             logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
             self._check_pretrain_norm_mode_compat(resume_path)
             return
 
         if self.pretrained_ckpt:
             pt_path = self._resolve_pretrained_ckpt_path(self.pretrained_ckpt)
+            if getattr(self, "lora_spec", None) is not None:  # loaded before prepare(), see _prepare_lora_model
+                self._check_pretrain_norm_mode_compat(pt_path)
+                return
             logger.info(
                 "Loading pretrained weights (warm-init, fresh optimizer/scheduler/step): %s",
                 pt_path,
@@ -362,7 +454,144 @@ class Wan22Trainer:
                 optimizer=None,
                 strict_shape=self.pretrained_ckpt_strict_shape,
             )
+            self._reseed_deepspeed_master_params("warm-init")
+            self._warminit_canary_arm("warm-init")
             self._check_pretrain_norm_mode_compat(pt_path)
+
+
+    def _reseed_deepspeed_master_params(self, what: str):
+        """Re-read DeepSpeed's fp32 master weights from the just-loaded bf16 params.
+
+        ZeRO 1/2 clones its fp32 master partition out of the flat bf16 buffer
+        inside `accelerator.prepare()`, which runs BEFORE this class loads any
+        `.pt` weights. An in-place `load_checkpoint` after that touches only the
+        bf16 view, and the first `optimizer.step()` copies the stale master
+        partition straight back over it — so the load is silently undone from
+        step 2 onward, with no error and no warning. `refresh_fp32_params()`
+        re-reads the partition from the current bf16 weights, so the loaded
+        values survive. Full-state resumes go through `accelerator.load_state`,
+        which restores the master copy itself and does not need this. A no-op
+        when the optimizer is not a DeepSpeed one.
+
+        Walks the wrapper chain to exhaustion rather than a fixed depth: an
+        accelerate upgrade that inserts another wrapper must not silently
+        reinstate the bug. On DeepSpeed a miss is fatal, because "quietly did
+        nothing" is exactly the failure mode this method exists to prevent.
+        """
+        opt, seen = self.optimizer, set()
+        while opt is not None and id(opt) not in seen:
+            seen.add(id(opt))
+            refresh = getattr(opt, "refresh_fp32_params", None)
+            if callable(refresh):
+                refresh()
+                logger.info(
+                    "Re-seeded DeepSpeed fp32 master params after %s (%s).",
+                    what, type(opt).__name__,
+                )
+                return
+            opt = getattr(opt, "optimizer", None)
+        chain = " -> ".join(_optimizer_chain_names(self.optimizer))
+        if self._is_deepspeed():
+            raise RuntimeError(
+                f"DeepSpeed is active but no refresh_fp32_params() was found on the "
+                f"optimizer chain ({chain}). Weights loaded after accelerator.prepare() "
+                f"would be silently reverted at the first optimizer.step(); refusing to "
+                f"train. See _reseed_deepspeed_master_params."
+            )
+        logger.info("No DeepSpeed master params to re-seed after %s (%s).", what, chain)
+
+    def _is_deepspeed(self) -> bool:
+        return str(getattr(self.accelerator.state, "distributed_type", "")).upper().endswith("DEEPSPEED")
+
+    def _backward_loss(self, loss):
+        """Scale the loss so the optimizer sees the MEAN over micro-batches.
+
+        `training_loss()` bypasses `DeepSpeedEngine.forward()`, where DeepSpeed
+        registers that divide, and accelerate skips its own on this backend
+        (docs/TRAINING.md §6).
+        """
+        if not self._is_deepspeed():
+            return loss
+        return loss / self.gradient_accumulation_steps
+
+    def _clip_max_norm(self) -> float:
+        """The value for `clip_grad_norm_`; `max_grad_norm <= 0` disables clipping.
+
+        inf reads the norm and clips nothing, where 0.0 would scale every gradient
+        to ZERO on the torch path. Ignored entirely under DeepSpeed, which has
+        already clipped and stepped inside `accelerator.backward()`.
+        """
+        return self.max_grad_norm if self.max_grad_norm > 0 else float("inf")
+
+    # Relative L2 drift allowed between the loaded weights and the weights after
+    # the first optimizer step. Measured on the released robotwin donor against
+    # its real revert target (Wan2.2 base + the ActionDiT interp init): a genuine
+    # revert is 0.121. A healthy step is bf16 rounding (~0.001) plus one AdamW
+    # update (<=0.005 even at lr 1e-4 with no warmup). 0.03 sits ~6x above the
+    # healthy ceiling and ~4x below a real revert.
+    #
+    # Cosine similarity was used here until 2026-09-10 with a 0.9 floor, and it
+    # could not fire: the sampled tensors are the pretrained Wan2.2 backbone,
+    # which the donor and the revert target SHARE, so a real revert scored 0.9927.
+    # Cosine saturates on correlated vectors; relative L2 does not.
+    #
+    # Exceeding it logs WARM_INIT_CANARY_FAILED and does NOT abort. This is a
+    # numerical heuristic with an estimated threshold, so a false positive would
+    # kill a multi-node job that waited hours to schedule -- and the first time
+    # it did, someone would delete the guard. The hard failure lives in
+    # _reseed_deepspeed_master_params, a structural check that cannot
+    # false-positive. What made this bug expensive was silence, not the absence
+    # of an abort.
+    _CANARY_MAX_DRIFT = 0.03
+
+    def _warminit_canary_arm(self, tag: str):
+        """Snapshot a few just-loaded tensors so the first step can be checked.
+
+        Backend-agnostic guard on the whole class of bug: if anything reverts the
+        weights between the load and the first optimizer step, the sampled values
+        move far further than one optimizer step could move them. Note the revert
+        target is NOT a random init — it is whatever `prepare()` snapshotted,
+        i.e. the pretrained backbone the donor was itself fine-tuned from — so
+        the two are highly correlated and only a distance metric separates them.
+        Costs one small copy of <=4096 elements.
+        """
+        self._canary = None
+        params = self._canary_params()
+        if not params:
+            return
+        flat = torch.cat([p.detach().reshape(-1)[:512].float().cpu() for p in params[:8]])
+        self._canary = (tag, flat)
+
+    def _canary_params(self):
+        if getattr(self, "lora_spec", None) is None:
+            return [p for p in self.model.parameters() if p.requires_grad and p.numel() >= 64]
+        # LoRA adapters are not loaded weights (lora_B starts at zero), so a LoRA
+        # weights-only resume samples the loaded trainable tensors only.
+        return [
+            p for n, p in self.model.named_parameters()
+            if p.requires_grad and p.numel() >= 64 and not n.endswith(LORA_SUFFIXES)
+        ]
+
+    def _warminit_canary_check(self):
+        """Verify the loaded weights survived the first optimizer step."""
+        armed, before = self._canary
+        self._canary = None
+        params = self._canary_params()
+        after = torch.cat([p.detach().reshape(-1)[:512].float().cpu() for p in params[:8]])
+        if after.shape != before.shape:
+            logger.warning("%s canary: tensor layout changed, skipping the check.", armed)
+            return
+        drift = float((after - before).norm() / (before.norm() + 1e-12))
+        if drift > self._CANARY_MAX_DRIFT:
+            logger.error(
+                "WARM_INIT_CANARY_FAILED: %s appears to have been REVERTED by the first "
+                "optimizer step (relative drift %.4f from the weights as loaded, limit %s). "
+                "This run is probably NOT training from the checkpoint its name claims. "
+                "See docs/TRAINING.md §6.",
+                armed, drift, self._CANARY_MAX_DRIFT,
+            )
+            return
+        logger.info("%s canary: weights survived the first step (drift=%.6f).", armed, drift)
 
     @staticmethod
     def _resolve_pretrained_ckpt_path(raw: str) -> Path:
@@ -581,6 +810,9 @@ class Wan22Trainer:
                     name, n_params,
                 )
         logger.info("Unfrozen modules: %s | Frozen: %s", unfrozen_names, sorted(frozen))
+        # LoRA: the loop above just re-enabled the whole MoT.
+        if getattr(model, "lora_spec", None) is not None:
+            apply_lora_trainability(model)
 
     @staticmethod
     def _to_batched_eval_sample(sample, model=None):
@@ -723,8 +955,50 @@ class Wan22Trainer:
 
         return out
 
+    @staticmethod
+    def _merge_eval_draws(draws):
+        """Average the numeric metrics of k val draws.
+
+        Draw i of an eval is `evaluate(draw_idx=i)`: a different val window of
+        the map-style dataset and a different rollout noise seed per draw, so
+        every numeric key is averaged, and val_loss / psnr / dino_mse get the
+        same sqrt(k) noise reduction as action_l1. Non-numeric values
+        (video_path, has_pointmap) come from the first draw.
+
+        `video_paths` collects EVERY draw's clip: k draws are k different
+        val windows, and `evaluate(draw_idx=)` keeps their files apart.
+        `video_path` stays the first draw's, for callers that want just one.
+
+        bool is excluded explicitly because it is a subclass of int and would
+        otherwise be silently averaged into a float.
+        """
+        if not draws or draws[0] is None:
+            return None
+        merged = dict(draws[0])
+        merged["video_paths"] = [
+            d["video_path"] for d in draws if d is not None and d.get("video_path")
+        ]
+        if len(draws) == 1:
+            return merged
+
+        def _num(v):
+            return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+        for key, first in draws[0].items():
+            if not _num(first):
+                continue
+            vals = [d[key] for d in draws if d is not None and _num(d.get(key))]
+            if vals:
+                merged[key] = float(sum(vals)) / len(vals)
+        return merged
+
     def _run_eval_and_log(self):
-        metrics = self.evaluate()
+        # eval_action_samples>1 repeats the whole call and averages (see
+        # _merge_eval_draws). evaluate() ends in accelerator.gather_for_metrics,
+        # a collective, so the draw count must be identical on every rank; it
+        # is, because eval_action_samples is a plain config scalar.
+        draws = [self.evaluate(draw_idx=i) for i in range(self.eval_action_samples)]
+        metrics = self._merge_eval_draws(draws)
         self.accelerator.wait_for_everyone()
         if metrics is None or not self.accelerator.is_main_process:
             return
@@ -775,18 +1049,71 @@ class Wan22Trainer:
                 row_descs.append("pred_pt_depth / vae_recon_pt_depth / gt_pt_depth")
                 row_descs.append("pred_pt_vae_pca / gt_pt_vae_pca / gt_pt_vae_norm")
             row_descs.append("pred_vae_pca / gt_vae_pca / gt_vae_norm")
-            caption = f"step {self.global_step} | " + " | ".join(
-                f"row{i}: {d}" for i, d in enumerate(row_descs, 1)
-            )
-            eval_payload["eval/video"] = wandb.Video(
-                metrics["video_path"], caption=caption,
-            )
+            rows = " | ".join(f"row{i}: {d}" for i, d in enumerate(row_descs, 1))
+            # One clip per val draw: k draws are k different val windows. A list
+            # under a single key keeps them side by side in the existing
+            # `eval/video` panel rather than fanning out k new panels; a lone
+            # draw still logs a bare Video so k=1 renders exactly as before.
+            paths = [
+                p for p in (metrics.get("video_paths") or [metrics["video_path"]])
+                if os.path.isfile(p)
+            ]
+            vids = [
+                wandb.Video(
+                    p,
+                    caption=(
+                        f"step {self.global_step}"
+                        + (f" | val window {i}/{len(paths)}" if len(paths) > 1 else "")
+                        + f" | {rows}"
+                    ),
+                )
+                for i, p in enumerate(paths, 1)
+            ]
+            eval_payload["eval/video"] = vids if len(vids) > 1 else vids[0]
         if "dino_mse" in metrics:
             eval_payload["eval/dino_mse"] = float(metrics["dino_mse"])
         self._wandb_log(eval_payload)
 
     @torch.no_grad()
-    def evaluate(self):
+    def _log_train_data_video(self, sample):
+        """Save + wandb-log the GT clip of the current train batch (sample 0),
+        exactly as fed to the model, with no inference. Handles both batch
+        shapes: composite 'video' and 'per_cam' (composed via the model's
+        layout). Caption = prompt."""
+        if "video" in sample:
+            video = sample["video"][0]  # [3, T, H, W] in (-1, 1)
+        elif "per_cam" in sample:
+            from flexpi.per_cam_compose import compose_from_per_cam
+            model = self.accelerator.unwrap_model(self.model)
+            video = compose_from_per_cam(
+                {k: v[:1] for k, v in sample["per_cam"].items()},
+                **model._layout_kwargs(),
+            )[0]
+        else:
+            return
+        frames = (
+            (video.detach().float().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5
+        ).clamp(0, 255).byte().numpy()  # [T, H, W, 3] uint8
+        frames_pil = [Image.fromarray(f) for f in frames]
+        out_path = os.path.join(
+            self.eval_dir, f"step_{self.global_step:06d}_train_data.mp4"
+        )
+        save_mp4(frames_pil, out_path, fps=4)
+        prompt = sample.get("prompt")
+        caption = str(prompt[0]) if prompt is not None else ""
+        if self.wandb_run is not None:
+            import wandb
+            self._wandb_log(
+                {"data/train_video": wandb.Video(out_path, caption=caption, format="mp4")}
+            )
+
+    @torch.no_grad()
+    def evaluate(self, draw_idx: int = 0):
+        """One val draw. `draw_idx` selects the val window and the rollout
+        noise seed, and names the output mp4, so that eval_action_samples>1
+        yields k different windows instead of one window k times. Draw 0 is
+        the single-draw eval unchanged; the offset is the same on every rank,
+        so ranks stay apart by process_index exactly as they did before."""
         if self.val_dataset is None:
             return None
 
@@ -795,9 +1122,18 @@ class Wan22Trainer:
         model.eval()
 
         # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
-        rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
+        rng = torch.Generator(device="cpu").manual_seed(
+            self.global_step + self.accelerator.process_index + 1_000_003 * draw_idx
+        )
         eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
         sample = self._to_batched_eval_sample(self.val_dataset[eval_index], model=model)
+
+        # Sampling must zero the same padded action channels training zeroes,
+        # or the val rollout feeds N(0,1) where training fed exact 0. The
+        # deploy server arms this from its config; here the mask is
+        # per-sample. Cleared again before returning so training is untouched.
+        if hasattr(model, "set_action_dim_mask"):
+            model.set_action_dim_mask(sample.get("action_dim_is_pad", None))
 
         # 1. training loss
         with self.accelerator.autocast():
@@ -830,7 +1166,7 @@ class Wan22Trainer:
             "text_cfg_scale": 1.0,
             "action_cfg_scale": 1.0,
             "num_inference_steps": self.eval_num_inference_steps,
-            "seed": 42,
+            "seed": 42 + draw_idx,
             "tiled": False,
         }
         # FlexPi3D-specific: forward per_cam_depth + camera_intrinsics + per_cam
@@ -919,6 +1255,21 @@ class Wan22Trainer:
             action_meta = processor.shape_meta["action"]
             state_meta = processor.shape_meta["state"]
 
+            # Action metrics average over the embodiment's REAL channels only.
+            # Padded head channels are loss-masked in training, so their head
+            # output is unconstrained: on the identity merger they survive
+            # denorm at +-3.14 rad, two dims of O(1 rad) noise against
+            # ~0.01-0.1 real error; on scatter layouts they come back as exact
+            # zeros and dilute the mean by the pad fraction. Either way they
+            # are not the policy's error.
+            _pad = sample.get("action_dim_is_pad", None)
+            _pad = _pad[0].bool().cpu() if isinstance(_pad, torch.Tensor) else None
+
+            def _real_dims(diff):
+                if _pad is None or _pad.shape[-1] != diff.shape[-1] or not bool(_pad.any()):
+                    return diff
+                return diff[..., ~_pad]
+
             def _denorm(raw_action, name="action"):
                 if not isinstance(raw_action, torch.Tensor):
                     raise TypeError(f"{name} must be a torch.Tensor, got {type(raw_action)}")
@@ -956,7 +1307,7 @@ class Wan22Trainer:
                         "Predicted action/GT action shape mismatch after denormalization: "
                         f"pred={tuple(pred_action_denorm.shape)} vs gt={tuple(gt_action_denorm.shape)}"
                     )
-                action_diff = pred_action_denorm - gt_action_denorm
+                action_diff = _real_dims(pred_action_denorm - gt_action_denorm)
                 action_l1 = action_diff.abs().mean().item()
                 action_l2 = action_diff.pow(2).mean().item()
 
@@ -969,6 +1320,8 @@ class Wan22Trainer:
         if not self.eval_video:
             psnr_rollout_vs_decode = ssim_rollout_vs_decode = float("nan")
             psnr_decode_vs_gt = ssim_decode_vs_gt = float("nan")
+            if hasattr(model, "set_action_dim_mask"):
+                model.set_action_dim_mask(None)
             if was_dit_training:
                 self._set_dit_only_train_mode()
             local_metrics = torch.tensor(
@@ -1028,9 +1381,14 @@ class Wan22Trainer:
             frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
             stitched_frames.append(Image.fromarray(frame))
 
+        # The name embeds global_step + process_index, neither of which varies
+        # across the k draws of one eval; draw 0 keeps the historic name so
+        # earlier eval_dir contents stay directly comparable.
+        draw_suffix = f"_draw_{draw_idx:02d}" if draw_idx else ""
         video_path = os.path.join(
             self.eval_dir,
-            f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
+            f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}"
+            f"{draw_suffix}.mp4",
         )
         # DINO + VAE latent visualization — combine with video into single stitched output
         dino_mse = None
@@ -1147,7 +1505,14 @@ class Wan22Trainer:
             # --- Pointmap row (from FlexPi3D joint inference output) ---
             if pred_pointmap_latents is not None and hasattr(model, "pointmap_encoder"):
                 drew_pointmap_row = True
-                K = model._resolve_camera_intrinsics()
+                # Prefer THIS sample's own K over the model's cached fallback:
+                # the cache holds whatever was set last, which is the wrong
+                # rig whenever the val clip comes from another corpus of a mix.
+                K = sample.get("camera_intrinsics")
+                if isinstance(K, torch.Tensor):
+                    K = K.to(device=model.device)
+                else:
+                    K = model._resolve_camera_intrinsics()
 
                 if "per_cam_depth" not in sample:
                     raise KeyError(
@@ -1304,6 +1669,16 @@ class Wan22Trainer:
             import traceback
             logger.warning("DINO/Pointmap/VAE visualization failed: %s\n%s", e, traceback.format_exc())
 
+        # Burn the language instruction into the clip. Placed at the single
+        # save_mp4 choke point so it covers the fallback path above too (where
+        # the aux rows failed and stitched_frames is video-only). Wrapped: a
+        # font or draw failure must never kill a multi-node run, the same rule
+        # the visualization block above follows.
+        try:
+            stitched_frames = add_caption_band(stitched_frames, str(prompt or ""))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("prompt caption band failed: %s", e)
+
         save_mp4(stitched_frames, video_path, fps=8)
 
         local_metrics = torch.tensor(
@@ -1326,6 +1701,8 @@ class Wan22Trainer:
         action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
         action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
 
+        if hasattr(model, "set_action_dim_mask"):
+            model.set_action_dim_mask(None)
         if was_dit_training:
             self._set_dit_only_train_mode()
 
@@ -1352,7 +1729,12 @@ class Wan22Trainer:
     def _save_weights_checkpoint(self, step_tag: str):
         model = self.accelerator.unwrap_model(self.model)
         ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
-        model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
+        model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)  # merged under LoRA
+        if self.lora_spec is not None:
+            torch.save(
+                adapter_payload(model, step=self.global_step, base_ckpt=self._lora_base_ckpt),
+                os.path.join(self.lora_dir, f"{step_tag}.pt"),
+            )
         return ckpt_path
 
     def _save_trainer_state(self, state_path: str):
@@ -1361,7 +1743,14 @@ class Wan22Trainer:
             "global_step": int(self.global_step),
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
+            # Tri-state (None = no training batch decided yet); a resume that
+            # saves before its first step must not turn "unknown" into False.
+            "action_dim_mask_trained": getattr(
+                self.accelerator.unwrap_model(self.model), "_action_dim_mask_trained", None
+            ),
         }
+        if getattr(self, "lora_spec", None) is not None:
+            payload["lora"] = {"config": self.lora_spec.to_dict(), "base_ckpt": self._lora_base_ckpt}
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
@@ -1414,7 +1803,8 @@ class Wan22Trainer:
             else:
                 logger.warning("[ckpt] discarding partial checkpoint step=%d and continuing training",
                                self.global_step)
-                for p in (state_path, os.path.join(self.weights_dir, f"{step_tag}.pt")):
+                for p in (state_path, os.path.join(self.weights_dir, f"{step_tag}.pt"),
+                          os.path.join(self.lora_dir, f"{step_tag}.pt")):
                     if os.path.isdir(p):
                         shutil.rmtree(p, ignore_errors=True)
                     elif os.path.exists(p):
@@ -1441,19 +1831,22 @@ class Wan22Trainer:
             shutil.rmtree(path, ignore_errors=True)
 
     def _prune_old_weights(self, keep: int):
-        """Delete all but the `keep` most recent weights/step_*.pt files (main proc only)."""
+        """Delete all but the `keep` most recent weights/step_*.pt (and lora/step_*.pt) files (main proc only)."""
         if keep is None or keep <= 0:
             return
-        entries = [
-            (int(m.group(1)), e.path)
-            for e in os.scandir(self.weights_dir)
-            if e.is_file() and (m := re.fullmatch(r"step_(\d+)\.pt", e.name))
-        ]
-        for _step, path in sorted(entries)[:-keep]:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        for d in (self.weights_dir, self.lora_dir):
+            if not os.path.isdir(d):
+                continue
+            entries = [
+                (int(m.group(1)), e.path)
+                for e in os.scandir(d)
+                if e.is_file() and (m := re.fullmatch(r"step_(\d+)\.pt", e.name))
+            ]
+            for _step, path in sorted(entries)[:-keep]:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     def load_training_state(self, state_dir: str):
         self.accelerator.load_state(input_dir=state_dir)
@@ -1462,6 +1855,22 @@ class Wan22Trainer:
             with open(state_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             self.global_step = int(payload["global_step"])
+            if getattr(self, "lora_spec", None) is not None and "lora" in payload:
+                # alpha and dropout are not tensors, so load_state restores the
+                # adapters under whatever the current cfg says; a change would
+                # rescale the trained delta at this step.
+                saved = payload["lora"]["config"]
+                if saved != self.lora_spec.to_dict():
+                    raise ValueError(
+                        f"lora config {self.lora_spec.to_dict()} differs from the resumed run's {saved}"
+                    )
+                self._lora_base_ckpt = payload["lora"]["base_ckpt"]
+            if "action_dim_mask_trained" in payload:
+                # None stays None: a resume that lands at max_steps saves weights
+                # without running a masked step and must not stamp False.
+                self.accelerator.unwrap_model(self.model)._action_dim_mask_trained = payload[
+                    "action_dim_mask_trained"
+                ]
 
             if "epoch" in payload and "batch_in_epoch" in payload:
                 self.epoch = int(payload["epoch"])
@@ -1562,14 +1971,18 @@ class Wan22Trainer:
 
                 with self.accelerator.autocast():
                     loss, loss_dict = train_model.training_loss(sample)
-                self.accelerator.backward(loss)
+                self.accelerator.backward(self._backward_loss(loss))
 
                 if self.accelerator.sync_gradients:
-                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    grad_norm = self.accelerator.clip_grad_norm_(
+                        self.model.parameters(), self._clip_max_norm()
+                    )
                     self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
+                    if self._canary is not None:
+                        self._warminit_canary_check()
                     self.global_step += 1
                     global_loss = float(
                         self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
@@ -1647,6 +2060,20 @@ class Wan22Trainer:
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
                         self._wandb_log(wandb_payload)
+
+                    # Train-data video probe (GT clip only, no inference) on
+                    # its own cadence, see train_video_log_every. Rank-0 local,
+                    # no collectives; a viz failure must never kill a
+                    # multi-node run.
+                    if (
+                        self.train_video_log_every > 0
+                        and self.global_step % self.train_video_log_every == 0
+                        and self.accelerator.is_main_process
+                    ):
+                        try:
+                            self._log_train_data_video(sample)
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("train-data video log failed: %s", e)
 
                     if (
                         self.eval_every > 0

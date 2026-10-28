@@ -28,6 +28,7 @@ from flexpi.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from flexpi.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from flexpi.per_cam_compose import compose_robotwin_from_per_cam
 from flexpi.datasets.lerobot.robot_video_dataset import _PER_CAM_HW
+from flexpi.models.helpers.action_pad import resolve_action_dim_mask
 
 logger = logging.getLogger(__name__)
 
@@ -152,8 +153,12 @@ def _find_trained_config(ckpt_path: Path) -> Optional[Path]:
     Training writes `<run_dir>/config.yaml` (see runtime.run_training). The ckpt
     typically lives at `<run_dir>/checkpoints/weights/step_XXXX.pt`, so we walk
     up a few parents looking for it.
+
+    ``absolute()`` rather than ``resolve()``: in a checkpoint directory whose
+    weights file is a symlink beside its sidecars, resolving would walk the
+    link target's directory instead.
     """
-    for parent in list(ckpt_path.resolve().parents)[:5]:
+    for parent in list(ckpt_path.absolute().parents)[:5]:
         candidate = parent / "config.yaml"
         if candidate.is_file():
             return candidate
@@ -198,6 +203,7 @@ class WorldActionRobotWinPolicy:
         self,
         model_cfg: DictConfig,
         processor_cfg: DictConfig,
+        trained_cfg: DictConfig,
         checkpoint_path: str,
         dataset_stats_path: Path,
         device: str,
@@ -229,7 +235,8 @@ class WorldActionRobotWinPolicy:
         glue_cache: bool = False,
         encoder_cuda_graph: bool = False,
         joint_loop_cuda_graph: bool = False,
-        use_per_cam: bool = False,
+        # None = auto-detect from the built model's infer_action signature.
+        use_per_cam: Optional[bool] = None,
         dynamic_step_skip: bool = False,
         step_skip_thresholds: Optional[list] = None,
         step_skip_sim_sources: Optional[list] = None,
@@ -245,6 +252,9 @@ class WorldActionRobotWinPolicy:
         infer_present_video: Optional[bool] = None,
         infer_present_dino: Optional[bool] = None,
         infer_present_pointmap: Optional[bool] = None,
+        # EVALUATION.action_dim_mask: None decides from the checkpoint,
+        # True/False forces.
+        action_dim_mask: Optional[bool] = None,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         if offload_text_encoder:
@@ -292,6 +302,16 @@ class WorldActionRobotWinPolicy:
         dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
         self.processor.set_normalizer_from_stats(dataset_stats)
 
+        # Padded action-head channels stay at exactly 0 through denoising iff
+        # training zeroed them too: a checkpoint deploys the way it trained.
+        # Armed before _warmup so a compiled graph captures the mask it serves.
+        pad, reason = resolve_action_dim_mask(self.processor, self.model, trained_cfg, action_dim_mask)
+        self.model.set_action_dim_mask(pad)
+        if pad is not None:
+            print(f"[FlexPi] action_dim_mask: channels {torch.nonzero(pad).flatten().tolist()} zero-filled")
+        else:
+            print(f"[FlexPi] action_dim_mask: not armed ({reason})")
+
         self.action_horizon = int(action_horizon)
         self.replan_steps = int(max(1, min(replan_steps, action_horizon)))
         self.num_inference_steps = int(num_inference_steps)
@@ -303,8 +323,11 @@ class WorldActionRobotWinPolicy:
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
         self._num_video_frames = int(num_video_frames)
-        self.use_per_cam = bool(use_per_cam)
         model_accepts_per_cam = "per_cam" in inspect.signature(self.model.infer_action).parameters
+        if use_per_cam is None:
+            use_per_cam = model_accepts_per_cam
+            print(f"[FlexPi] use_per_cam={use_per_cam} (auto-detected from model.infer_action signature)")
+        self.use_per_cam = bool(use_per_cam)
         if self.use_per_cam and model_accepts_per_cam:
             print("[FlexPi] use_per_cam=True, model accepts per_cam → per-cam path active")
         elif self.use_per_cam and not model_accepts_per_cam:
@@ -391,7 +414,7 @@ class WorldActionRobotWinPolicy:
         device = self.model.device
         dtype = self.model.torch_dtype
 
-        # Composite input image — RoboTwin layout per FlexPi CLAUDE.md.
+        # Composite input image — the RoboTwin 384x320 layout.
         dummy_image = torch.zeros((1, 3, 384, 320), device=device, dtype=dtype)
 
         # Encode a dummy prompt (cleared after warmup so first real prompt re-encodes).
@@ -921,32 +944,15 @@ def get_model(usr_args: Dict[str, Any]):
     # wrists 224×224) and forward them to infer_action when the model accepts
     # `per_cam`. Resolution order:
     #   1. explicit override (CLI `use_per_cam=...` or `EVALUATION.use_per_cam`)
-    #   2. auto-detect from trained config's `data.train._target_`
-    #      (a per-cam loader → true, anything else → false)
-    #   3. default false
+    #   2. None: WorldActionRobotWinPolicy auto-detects from the built model,
+    #      whose `infer_action` declares `per_cam` iff the per-cam input path
+    #      exists. The data loader's class name is not consulted: every loader
+    #      this codebase trains with (map-style or streaming) emits per-cam RGB.
     explicit_use_per_cam = usr_args.get("use_per_cam", cfg.EVALUATION.get("use_per_cam"))
+    use_per_cam = None
     if not _is_none_like(explicit_use_per_cam):
         use_per_cam = _parse_bool(explicit_use_per_cam)
         print(f"[FlexPi] use_per_cam={use_per_cam} (explicit override)")
-    elif trained_cfg is not None:
-        trained_target = str(trained_cfg.data.train.get("_target_", ""))
-        # Two spellings mean per-cam RGB: today's single loader
-        # (robot_video_dataset.RobotVideoDataset) and the pre-merge
-        # RobotPerCam{,Depth}VideoDataset it replaced — every one of the 25
-        # saved run configs carries the latter. The only loader that ever
-        # emitted a composite `video` was the pre-merge RobotVideoDataset,
-        # which no task config referenced and no checkpoint was trained with.
-        use_per_cam = (
-            trained_target.endswith("RobotVideoDataset")
-            or "RobotPerCam" in trained_target
-        )
-        print(
-            f"[FlexPi] use_per_cam={use_per_cam} "
-            f"(auto-detected from trained data.train._target_={trained_target})"
-        )
-    else:
-        use_per_cam = False
-        print("[FlexPi] use_per_cam=False (default; no trained config and no override)")
 
     # Step-skipping (joint-variant models only; other models silently ignore).
     def _materialize_list(raw):
@@ -1005,10 +1011,16 @@ def get_model(usr_args: Dict[str, Any]):
     infer_present_pointmap = _parse_optional_bool_arg(
         usr_args.get("infer_present_pointmap", cfg.EVALUATION.get("infer_present_pointmap"))
     )
+    action_dim_mask = _parse_optional_bool_arg(
+        usr_args.get("action_dim_mask", cfg.EVALUATION.get("action_dim_mask"))
+    )
 
     policy = WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
         processor_cfg=cfg.data.train.processor,
+        # The config the checkpoint trained under; the preset stands in when
+        # no config.yaml was found beside the checkpoint.
+        trained_cfg=trained_cfg if trained_cfg is not None else cfg,
         checkpoint_path=str(checkpoint_path),
         dataset_stats_path=dataset_stats_path,
         device=device,
@@ -1051,6 +1063,7 @@ def get_model(usr_args: Dict[str, Any]):
         infer_present_video=infer_present_video,
         infer_present_dino=infer_present_dino,
         infer_present_pointmap=infer_present_pointmap,
+        action_dim_mask=action_dim_mask,
     )
     return policy
 

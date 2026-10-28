@@ -9,7 +9,10 @@ Sample dict:
   - ``per_cam``:           dict[cam -> Tensor [C, T_video, H, W]] float32 in [-1, 1]
   - ``per_cam_depth``:     dict[cam -> Tensor [T_video, H, W]] uint16 mm
                            (present iff ``shape_meta.depth`` is declared)
-  - ``camera_intrinsics``: Tensor [num_cams, 3, 3]
+  - ``camera_intrinsics``: Tensor [num_cams, 3, 3] — the sample's episode K when
+                           the dataset ships ``meta/episode_intrinsics.jsonl``,
+                           otherwise the dataset-wide K from
+                           ``meta/camera_intrinsics.json``
   - plus action, proprio, context, context_mask, prompt, and the *_is_pad flags.
 
 RGB is served per-camera; the model composites it (``per_cam_compose``). The
@@ -26,6 +29,7 @@ padded).
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import os
@@ -141,6 +145,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         concat_multi_camera: Optional[str] = None, # a registered LayoutSpec name ("tshape_robotwin_384x320_uniform", "tshape_libero_2cam_448x512"), or None
         composite_layout_slot_key_map: Optional[Mapping[str, str]] = None, # for layout-driven modes: override default_slot_key_map. Keys are layout slot placeholders (e.g. "slot_tl"); values are dataset cam keys (e.g. "cam_high"). None → use the layout's default.
         composite_layout_text_prefix: bool = False, # if True, prepend the layout's text_prefix to the T5 prompt (off by default)
+        per_episode_intrinsics: str = "auto", # "auto" = use meta/episode_intrinsics.jsonl when the dataset ships it, else the dataset-wide camera_intrinsics.json; "require" = error if a dir lacks it; "off" = ignore it and always use camera_intrinsics.json
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
         num_episodes: Optional[int] = None, # limit episodes per dataset dir (for quick experiments)
         dataset_weights: Optional[list] = None, # per-dataset *frame* sampling probabilities, parallel to dataset_dirs (size-agnostic mixing, e.g. [0.2,0.8]); requires samples_per_epoch
@@ -153,6 +158,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         synthetic_zero_cams: Optional[list] = None,
         exterior_view_aug_prob: float = 0.0,
         exterior_view_aug_keys: Optional[list] = None,
+        emit_action_dim_is_pad: bool = False, # forward the processor's per-sample action/proprio pad masks to the model (loss over the real channels, padded channels zeroed on the DiT input and target); off → the model trains on every channel, as the LIBERO / RoboTwin / 32-D YAM recipes always have
     ):
         # ── shape_meta: cameras, and whether this run carries depth ──────
         # Read shape_meta BEFORE calling super, because super's __init__
@@ -255,6 +261,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.text_embedding_cache_dir = text_embedding_cache_dir
         self.context_len = context_len
         self.skip_padding_as_possible = skip_padding_as_possible
+        self.emit_action_dim_is_pad = bool(emit_action_dim_is_pad)
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         # Resolve layout for layout-driven modes (i.e. registered names like
@@ -323,11 +330,70 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         # idx and look up per-sample at __getitem__ time. Available for any
         # layout-driven mode (the LayoutSpec defines per-cam K targets via slot
         # HW); legacy "horizontal"/"vertical" modes don't load K.
+        # A dataset may additionally ship meta/episode_intrinsics.jsonl, giving
+        # one K per episode — necessary when the capture spans rigs with
+        # different optics (ABC-130k is the worked example), where a single
+        # averaged K is wrong by
+        # tens of percent and silently mis-scales metric depth. When present it
+        # takes precedence per sample; when absent the per-dataset K is used
+        # exactly as before.
+        if per_episode_intrinsics not in ("auto", "require", "off"):
+            raise ValueError(
+                f"per_episode_intrinsics must be 'auto', 'require' or 'off'; "
+                f"got {per_episode_intrinsics!r}"
+            )
+        self.per_episode_intrinsics = per_episode_intrinsics
         self._per_dataset_intrinsics: list[Optional[torch.Tensor]] = []
+        self._per_episode_intrinsics: list[
+            Optional[tuple[dict[int, int], torch.Tensor]]
+        ] = []
         if self._layout is not None:
             dirs = list(dataset_dirs) if not isinstance(dataset_dirs, (str, os.PathLike)) else [dataset_dirs]
             for d in dirs:
                 self._per_dataset_intrinsics.append(self._load_layout_intrinsics_for_dir(str(d)))
+                table = (None if per_episode_intrinsics == "off"
+                         else self._load_per_episode_intrinsics_for_dir(str(d)))
+                if table is None and per_episode_intrinsics == "require":
+                    raise FileNotFoundError(
+                        f"per_episode_intrinsics='require' but {d} has no usable "
+                        f"meta/episode_intrinsics.jsonl. Build it, or set "
+                        f"per_episode_intrinsics='auto' to fall back to "
+                        f"meta/camera_intrinsics.json."
+                    )
+                self._per_episode_intrinsics.append(table)
+            if per_episode_intrinsics == "off":
+                logger.info("per_episode_intrinsics='off': using one K per camera "
+                            "per dataset dir, ignoring any episode_intrinsics.jsonl")
+            # A dir with no intrinsics of any kind used to construct fine
+            # with an INFO log, and fail an epoch later: __getitem__ simply never
+            # sets data["camera_intrinsics"] for that dir, so default_collate
+            # raises a bare KeyError on the first batch that happens to mix dirs
+            # -- or, if every sample in the batch came from the bare dir, the key
+            # is silently absent and the pointmap stream trains off. Neither is
+            # detectable from the failure, so the absence is stated here, by
+            # name, before any training starts.
+            #
+            # Only when the depth block is declared. Without it the pointmap
+            # stream is off and NOTHING consumes K -- it is kept meaningful
+            # rather than arbitrary (see the `hw_meta` comment above) -- so an
+            # RGB-only composite run on a dataset that ships no intrinsics is
+            # legitimate and must keep working.
+            bare = ([str(d) for d, k in zip(dirs, self._per_dataset_intrinsics)
+                     if k is None] if getattr(self, "has_depth", False) else [])
+            if bare:
+                raise FileNotFoundError(
+                    "layout-driven mode needs camera intrinsics, but these "
+                    "dataset dirs ship neither meta/camera_intrinsics.json nor a "
+                    "usable meta/episode_intrinsics.jsonl:\n  "
+                    + "\n  ".join(bare)
+                    + "\nBuild them with the dataset's own builder (every "
+                      "builder that writes depth also writes these tables), or "
+                      "drop these dirs. "
+                      "Without K the pointmap stream would train on whatever "
+                      "default_collate does with a missing key.")
+        # Lazily-filled per-dataset (from, to, episode_index) lists, for the
+        # bisect in _resolve_episode.
+        self._ep_lookup_cache: list[Optional[tuple[list[int], list[int], list[int]]]] = []
         # Cumulative frame bounds so we can map a flat sample index → dataset idx.
         self._dataset_frame_bounds: list[int] = []
         cumul = 0
@@ -449,17 +515,49 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     # scales in lock-step with the resize in _get so RGB and depth
     # unprojection stay consistent.
     # ---------------------------------------------------------------------
-    def _load_layout_intrinsics_for_dir(self, dataset_dir: str) -> Optional[torch.Tensor]:
-        json_path = os.path.join(dataset_dir, "meta", "camera_intrinsics.json")
-        if not os.path.exists(json_path):
-            logger.info(f"No camera_intrinsics.json at {json_path}")
-            return None
-        with open(json_path, "r") as f:
-            raw = json.load(f)
+    def _restack_k_to_slots(self, K: torch.Tensor) -> torch.Tensor:
+        """``K`` in DISK order -> ``K`` in SLOT order. [n_disk,3,3] -> [n_slots,3,3].
+
+        ``PointmapEncoder`` indexes ``camera_intrinsics`` BY SLOT (``cam_idx``
+        over ``layout.cam_slots()``), while the loader builds K in the order the
+        cameras appear on disk. Under any non-identity ``slot_key_map`` those
+        two orders differ, and the result is each camera's depth unprojected
+        with ANOTHER camera's K — on this data a ~1.43x fx error, applied
+        silently to every frame.
+
+        This used to live inside ``if self.synthetic_zero_cams:``, which
+        made it accidental. Nothing about the mismatch depends on synthetic
+        cameras; it was latent only because no shipped config paired a
+        non-identity map with real ones, and adding one to a data preset
+        would have been enough to trigger it.
+
+        For the default map on a dataset whose disk order is the canonical
+        ``(cam_high, cam_left_wrist, cam_right_wrist)`` this returns the very
+        same tensor — byte-identical to before, and not even rebuilt. Slots with
+        no disk camera get an identity K: those are the synthetic ones, whose
+        depth is all-zero, so K is numerically irrelevant there.
+        """
+        slot_order = [self._slot_key_map[s.key] for s in self._layout.cam_slots()]
+        if slot_order == list(self._cams):
+            return K
+        disk_to_idx = {n: i for i, n in enumerate(self._cams)}
+        return torch.stack(
+            [K[disk_to_idx[name]] if name in disk_to_idx
+             else torch.eye(3, dtype=K.dtype)
+             for name in slot_order],
+            dim=0,
+        )
+
+    def _k_stack_from_raw(self, raw: dict, src: str) -> torch.Tensor:
+        """``{cam: {fx,fy,cx,cy,width,height}}`` → ``[num_cams, 3, 3]`` at the depth grid.
+
+        Shared by the per-dataset and per-episode loaders so both apply the same
+        endpoint rescale; `src` only names the file in error messages.
+        """
         Ks = []
         for cam_name, (h_target, w_target) in self._per_cam_hw:
             if cam_name not in raw:
-                raise KeyError(f"{json_path} missing '{cam_name}' (found: {list(raw)})")
+                raise KeyError(f"{src} missing '{cam_name}' (found: {list(raw)})")
             e = raw[cam_name]
             raw_fx, raw_fy = float(e["fx"]), float(e["fy"])
             raw_cx, raw_cy = float(e["cx"]), float(e["cy"])
@@ -476,12 +574,65 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                  [0.0,         raw_fy * sy, raw_cy * sy],
                  [0.0,         0.0,         1.0       ]], dtype=torch.float32,
             ))
-        K_stack = torch.stack(Ks, dim=0)  # [num_cams, 3, 3]
+        return torch.stack(Ks, dim=0)  # [num_cams, 3, 3]
+
+    def _load_layout_intrinsics_for_dir(self, dataset_dir: str) -> Optional[torch.Tensor]:
+        json_path = os.path.join(dataset_dir, "meta", "camera_intrinsics.json")
+        if not os.path.exists(json_path):
+            logger.info(f"No camera_intrinsics.json at {json_path}")
+            return None
+        with open(json_path, "r") as f:
+            raw = json.load(f)
+        K_stack = self._k_stack_from_raw(raw, json_path)
         logger.info(
             f"Loaded camera intrinsics from {json_path} (target per-cam sizes "
             f"{self._per_cam_hw})"
         )
         return K_stack
+
+    def _load_per_episode_intrinsics_for_dir(
+        self, dataset_dir: str,
+    ) -> Optional[tuple[dict[int, int], torch.Tensor]]:
+        """``meta/episode_intrinsics.jsonl`` → ``({episode_index: row}, [N, num_cams, 3, 3])``.
+
+        Returned as one stacked tensor plus a row index rather than a dict of
+        per-episode tensors: a dataset with ~10^5 episodes would otherwise pay
+        ~10^5 tensor objects of per-object overhead *in every dataloader
+        worker*, for 9 MB of actual numbers.
+
+        Optional. Datasets built before this file existed (or rigs whose optics
+        genuinely do not move) carry only ``camera_intrinsics.json``; those fall
+        back to the single per-dataset K, which is what the loader did before.
+        """
+        jsonl_path = os.path.join(dataset_dir, "meta", "episode_intrinsics.jsonl")
+        if not os.path.exists(jsonl_path):
+            return None
+        rows: list[torch.Tensor] = []
+        ep_to_row: dict[int, int] = {}
+        with open(jsonl_path, "r") as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                ep = int(rec["episode_index"])
+                if ep in ep_to_row:
+                    raise ValueError(
+                        f"{jsonl_path}:{line_no} repeats episode_index={ep} "
+                        f"(first seen on row {ep_to_row[ep]})"
+                    )
+                ep_to_row[ep] = len(rows)
+                rows.append(self._k_stack_from_raw(
+                    rec["intrinsics"], f"{jsonl_path}:{line_no}",
+                ))
+        if not rows:
+            logger.warning(f"{jsonl_path} is empty; falling back to camera_intrinsics.json")
+            return None
+        logger.info(
+            f"Loaded per-episode camera intrinsics for {len(rows)} episodes "
+            f"from {jsonl_path}"
+        )
+        return ep_to_row, torch.stack(rows, dim=0)
 
     # Back-compat alias: old call sites (e.g. RobotVideoDataset.
     # _load_robotwin_intrinsics_for_dir override) keep working.
@@ -496,6 +647,67 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         raise IndexError(
             f"flat_idx={flat_idx} outside dataset bounds {self._dataset_frame_bounds}"
         )
+
+    def _resolve_episode(self, sample, ds_idx: int) -> tuple[int, int, int]:
+        """Flat sample index → ``(ep_idx, ep_idx_local, frame_in_ep)``.
+
+        ``ep_idx`` is the on-disk episode index (what filenames and
+        meta/*.jsonl use); ``ep_idx_local`` indexes this dataset's
+        ``episode_data_index`` arrays.
+
+        The FlexPiProcessor strips episode_index / timestamp out of the sample
+        dict but retains the global frame index as ``sample["idx"]``, so the
+        episode is recovered from the multi-dataset's episode_data_index
+        boundaries (constructed in BaseLerobotDataset.__init__).
+        """
+        underlying_lerobot_ds = self.lerobot_dataset.multi_dataset._datasets[ds_idx]
+        global_idx = int(
+            sample["idx"].item() if isinstance(sample.get("idx"), torch.Tensor)
+            else sample["idx"]
+        )
+        # Translate combined frame index → per-underlying-dataset frame index.
+        # `BaseLerobotDataset.episode_data_index` is concatenated across all
+        # dataset_dirs with cumulative offsets, but `underlying_lerobot_ds`
+        # (and its `.episodes` list, used for ep_list[ep_idx_local] below) is
+        # per-dataset. Mixing the two indexes the wrong list when a sample
+        # comes from a non-first dataset_dir (IndexError on multi-dataset).
+        prev_cum = 0 if ds_idx == 0 else self._dataset_frame_bounds[ds_idx - 1]
+        local_idx = global_idx - prev_cum
+        ep_data_index = underlying_lerobot_ds.episode_data_index
+        from_arr = ep_data_index["from"]
+        to_arr = ep_data_index["to"]
+
+        # Cache the per-dataset lookup tables as plain Python lists. This runs
+        # for every sample, so both the episode scan and the ep_list rebuild
+        # that used to happen here cost O(num_episodes) per __getitem__ — fine
+        # at a few hundred episodes, ruinous at the tens of thousands ABC-130k
+        # produces. Built once per dataset, then it is a bisect plus indexing.
+        cache = self._ep_lookup_cache
+        while len(cache) <= ds_idx:
+            cache.append(None)
+        if cache[ds_idx] is None:
+            cache[ds_idx] = (
+                [int(x) for x in from_arr.tolist()],
+                [int(x) for x in to_arr.tolist()],
+                [int(x) for x in underlying_lerobot_ds.episodes]
+                if underlying_lerobot_ds.episodes is not None
+                else list(range(len(from_arr))),
+            )
+        from_list, to_list, ep_list = cache[ds_idx]
+
+        ep_idx_local = bisect.bisect_right(from_list, local_idx) - 1
+        if ep_idx_local < 0 or local_idx >= to_list[ep_idx_local]:
+            raise RuntimeError(
+                f"Couldn't locate episode for ds_idx={ds_idx} local_idx={local_idx} "
+                f"(global_idx={global_idx}, prev_cum={prev_cum}, range boundaries: "
+                f"{from_list} → {to_list})"
+            )
+        ep_idx = int(ep_list[ep_idx_local])
+        frame_in_ep = local_idx - from_list[ep_idx_local]
+        # Stash for the parent _get's DLTIMING emit. No-op when timing disabled.
+        if _dl_timing_enabled():
+            self._last_episode_info = (ep_idx, frame_in_ep)
+        return ep_idx, ep_idx_local, frame_in_ep
 
     def __len__(self):
         return len(self.lerobot_dataset)
@@ -711,34 +923,33 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        self._add_dim_pad_masks(sample, data)
         if per_cam_depth is not None:
             # dict[cam -> [T_video, H, W] uint16 mm]
             data["per_cam_depth"] = per_cam_depth
 
         if self._per_dataset_intrinsics:
             K = self._per_dataset_intrinsics[ds_idx]
+            # Per-episode K wins when the dataset ships the table. Resolving the
+            # episode is cheap (a bisect) but not free, so only do it when there
+            # is a table to look up in.
+            ep_table = (
+                self._per_episode_intrinsics[ds_idx]
+                if ds_idx < len(self._per_episode_intrinsics) else None
+            )
+            if ep_table is not None:
+                ep_to_row, K_all = ep_table
+                ep_idx_for_K, _, _ = self._resolve_episode(sample, ds_idx)
+                row = ep_to_row.get(ep_idx_for_K)
+                if row is None:
+                    raise KeyError(
+                        f"episode_intrinsics.jsonl for dataset {ds_idx} has no entry "
+                        f"for episode_index={ep_idx_for_K}. Rebuild the table or "
+                        f"remove it to fall back to meta/camera_intrinsics.json."
+                    )
+                K = K_all[row]
             if K is not None:
-                if self.synthetic_zero_cams:
-                    # K is [n_disk, 3, 3] in disk order. Extend to the full cam
-                    # set with identity K for synthetic cams (their depth is
-                    # all-zero, so K is numerically irrelevant). The
-                    # PointmapEncoder indexes camera_intrinsics BY SLOT (cam_idx
-                    # over layout.cam_slots()), so stack in SLOT order under the
-                    # resolved slot_key_map. For the default map this is the
-                    # canonical (cam_high, cam_left_wrist, cam_right_wrist) order
-                    # — byte-identical to before; a non-default map (e.g. the
-                    # wrist-top swap) reorders K to stay aligned with the slots.
-                    slot_order = [
-                        self._slot_key_map[s.key] for s in self._layout.cam_slots()
-                    ]
-                    disk_to_idx = {n: i for i, n in enumerate(self._cams)}
-                    stack = []
-                    for name in slot_order:
-                        if name in disk_to_idx:
-                            stack.append(K[disk_to_idx[name]])
-                        else:
-                            stack.append(torch.eye(3, dtype=K.dtype))
-                    K = torch.stack(stack, dim=0)
+                K = self._restack_k_to_slots(K)
                 data["camera_intrinsics"] = K   # [num_cams, 3, 3] float32 at native resolution
 
         # Exterior-view augmentation (in place on `data`; no-op when disabled).
@@ -785,8 +996,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         per_cam = data["per_cam"]
         per_cam_depth = data.get("per_cam_depth")
         K = data.get("camera_intrinsics")
-        # `camera_intrinsics` may alias the cached per-dataset K tensor
-        # (self._per_dataset_intrinsics[ds_idx]); clone before the in-place slot
+        # `camera_intrinsics` aliases a cached K tensor — either
+        # self._per_dataset_intrinsics[ds_idx] or an entry of
+        # self._per_episode_intrinsics[ds_idx]. Clone before the in-place slot
         # copy so we never corrupt the shared cache for later samples.
         if K is not None:
             K = K.clone()
@@ -820,40 +1032,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         # tolerance_s = max(underlying_lerobot_ds.tolerance_s, 1.5e-3)
         tolerance_s = underlying_lerobot_ds.tolerance_s
 
-        global_idx = int(
-            sample["idx"].item() if isinstance(sample.get("idx"), torch.Tensor)
-            else sample["idx"]
-        )
-        # Translate combined frame index → per-underlying-dataset frame index.
-        # `BaseLerobotDataset.episode_data_index` is concatenated across all
-        # dataset_dirs with cumulative offsets, but `underlying_lerobot_ds`
-        # (and its `.episodes` list, used for ep_list[ep_idx_local] below) is
-        # per-dataset. Mixing the two indexes the wrong list when a sample
-        # comes from a non-first dataset_dir (IndexError on multi-dataset).
-        prev_cum = 0 if ds_idx == 0 else self._dataset_frame_bounds[ds_idx - 1]
-        local_idx = global_idx - prev_cum
         ep_data_index = underlying_lerobot_ds.episode_data_index
         from_arr = ep_data_index["from"]
         to_arr = ep_data_index["to"]
-        ep_idx_local = None
-        for e in range(len(from_arr)):
-            if int(from_arr[e].item()) <= local_idx < int(to_arr[e].item()):
-                ep_idx_local = e
-                break
-        if ep_idx_local is None:
-            raise RuntimeError(
-                f"Couldn't locate episode for ds_idx={ds_idx} local_idx={local_idx} "
-                f"(global_idx={global_idx}, prev_cum={prev_cum}, range boundaries: "
-                f"{from_arr.tolist()} → {to_arr.tolist()})"
-            )
-        ep_list = list(underlying_lerobot_ds.episodes) if underlying_lerobot_ds.episodes is not None \
-                  else list(range(len(from_arr)))
-        ep_idx = int(ep_list[ep_idx_local])
-        frame_in_ep = local_idx - int(from_arr[ep_idx_local].item())
+        ep_idx, ep_idx_local, frame_in_ep = self._resolve_episode(sample, ds_idx)
         anchor_ts = frame_in_ep / float(fps)
-        # Stash for the parent _get's DLTIMING emit. No-op when timing disabled.
-        if _dl_timing_enabled():
-            self._last_episode_info = (ep_idx, frame_in_ep)
         # Clamp query ts to episode bounds so end-of-episode windows pad-by-repeat
         # the same way LeRobot does for RGB. `image_is_pad` flags the padded frames.
         ep_length = int(to_arr[ep_idx_local].item()) - int(from_arr[ep_idx_local].item())
@@ -945,6 +1128,21 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             })
         return per_cam_depth
 
+    def _add_dim_pad_masks(self, sample: dict, data: dict) -> None:
+        """Copy the processor's per-sample pad masks into ``data`` when the preset trains masked.
+
+        ``ScatterToChannels`` marks the head channels a corpus leaves empty
+        (``action_dim_is_pad`` / ``proprio_dim_is_pad``). With
+        ``emit_action_dim_is_pad`` on, they reach the model, which zeroes those
+        channels on the DiT input and target and averages the action loss over
+        the real ones; off, the model trains on every channel.
+        """
+        if not self.emit_action_dim_is_pad:
+            return
+        for key in ("action_dim_is_pad", "proprio_dim_is_pad"):
+            if key in sample:
+                data[key] = sample[key]
+
     def _get_cached_text_context(self, prompt: str):
         if self.text_embedding_cache_dir is None:
             raise ValueError("text_embedding_cache_dir is not set.")
@@ -979,11 +1177,60 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         return context, context_mask
 
+    # How many substituted samples one worker tolerates before it gives
+    # up. Per WORKER, not per epoch: a DataLoader worker gets its own copy of
+    # this object, so the effective budget is this times num_workers.
+    # ABC130K_MAX_SUBSTITUTIONS=0 disables substitution entirely (every error
+    # propagates), which is what a debugging run wants.
+    _MAX_SUBSTITUTIONS = int(os.environ.get("ABC130K_MAX_SUBSTITUTIONS", "64"))
+
+    @staticmethod
+    def _is_transient(e: BaseException) -> bool:
+        """Is this a failed READ, or a wrong DATASET?
+
+        Only the first is worth retrying elsewhere. The second — a missing K
+        row, a missing depth feature, a depth PTS mismatch — is a property of
+        the data, so every index hits it, and substituting merely converts a
+        hard failure into a training run quietly fed a different distribution.
+        """
+        # Structural, even though they are OSError subclasses: the file is not
+        # there, or not readable. Retrying a different index will not fix it.
+        if isinstance(e, (FileNotFoundError, IsADirectoryError,
+                          NotADirectoryError, PermissionError)):
+            return False
+        if isinstance(e, OSError):
+            return True          # a genuine IO error part-way through a read
+        # Decoder failures do not share a base class across torchcodec/av/ffmpeg.
+        return type(e).__name__ in {
+            "AVError", "FFmpegError", "DecoderError", "InvalidDataError", "EOFError",
+        }
+
     def __getitem__(self, idx):
         try:
             return self._get(idx)
         except Exception as e:
-            print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
+            # This used to be a blanket `except Exception` that printed a
+            # traceback and substituted a random sample. Every integrity check
+            # this loader performs — the missing-K-row KeyError, the missing depth
+            # feature, the depth PTS assertion — was therefore demoted to a log
+            # line, and a dataset that was wrong for ALL indices trained anyway
+            # on whatever the random retries happened to return.
+            if not self._is_transient(e):
+                raise
+            n = getattr(self, "_n_substitutions", 0) + 1
+            self._n_substitutions = n
+            if n > self._MAX_SUBSTITUTIONS:
+                raise RuntimeError(
+                    f"{n} samples substituted in this worker after transient "
+                    f"read errors (limit {self._MAX_SUBSTITUTIONS}); the most "
+                    f"recent was idx {idx}: {type(e).__name__}: {e}. Past this "
+                    f"many, it is not a flaky read — the data or the storage is "
+                    f"failing, and continuing would train on a silently "
+                    f"resampled distribution. Set ABC130K_MAX_SUBSTITUTIONS to "
+                    f"change the budget."
+                ) from e
+            print(f"[transient {n}/{self._MAX_SUBSTITUTIONS}] sample idx {idx}: "
+                  f"{type(e).__name__}: {e}. Substituting a random sample.")
             print(traceback.format_exc())
             return self._get(np.random.randint(len(self)))
 

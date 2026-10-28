@@ -17,6 +17,9 @@ Port reference:
   [18:20]  L_grip, R_grip             - **absolute, pass-through**
   [20:32]  L_joint(6), R_joint(6)     - delta (scalar subtraction)
 
+`state_dim=34` variant (AgiBot with AgiBotAbsoluteLookahead(keep_all_joints=True)):
+  identical except the joint block is [20:34] — L_joint(7), R_joint(7).
+
 Anchor (`anchor` ctor arg):
   "first" (default, matches yam_openpi): base = state[..., 0, :] — the FIRST
        obs frame in the window. For a sample starting at time t, the dataloader
@@ -41,9 +44,7 @@ Why rot6d on relative (and not delta-per-step) is safe here:
   Chunk-end (t = T_act - 1) at 30 Hz / horizon 32 ≈ 1s lookahead — relative
   rotations have meaningful magnitude (std O(0.1+)), avoiding the small-angle
   SNR collapse that broke the LIBERO 95975/97125 rot6d-on-per-step-delta
-  experiments. (Those ran through the rel-6D / absolute-lookahead transforms,
-  removed once no config selected them; `git log -- '*absolute_pose_lookahead*'`
-  recovers them.)
+  experiments documented in absolute_pose_lookahead.py.
 
 Why the asymmetric joint treatment (delta) vs EEF (SE(3) relative):
   Joints are scalars in a Euclidean space — additive delta is the natural
@@ -92,10 +93,18 @@ class Yam32DRelativeAction:
     and add (vs subtract) for the joint block.
     """
 
-    def __init__(self, anchor: _AnchorArg = "first") -> None:
+    def __init__(self, anchor: _AnchorArg = "first", state_dim: int = STATE_DIM) -> None:
         if anchor not in ("first", "last"):
             raise ValueError(f"anchor must be 'first' or 'last', got {anchor!r}")
+        # state_dim 32 (default) = the canonical yam_eef layout. 34 = AgiBot with
+        # AgiBotAbsoluteLookahead(keep_all_joints=True), whose joint blocks are 7
+        # DoF per arm instead of 6. Only the joint block widens: the EEF blocks
+        # [0:9]/[9:18] and the grippers [18:20] are identical in both layouts.
+        if state_dim not in (STATE_DIM, 34):
+            raise ValueError(f"state_dim must be {STATE_DIM} or 34, got {state_dim}")
         self.anchor: _AnchorArg = anchor
+        self.state_dim = int(state_dim)
+        self.joint_slice = slice(_JOINT_SLICE.start, self.state_dim)
 
     def set_shape_meta(self, shape_meta) -> None:
         pass
@@ -109,9 +118,9 @@ class Yam32DRelativeAction:
     def _apply(self, batch, *, backward: bool):
         if "state" not in batch:
             raise ValueError("Yam32DRelativeAction requires 'state' in batch (used as relative-base anchor)")
-        state = batch["state"]["default"]  # [..., T_obs, 32]
-        if state.shape[-1] != STATE_DIM:
-            raise ValueError(f"state last dim must be {STATE_DIM}, got {tuple(state.shape)}")
+        state = batch["state"]["default"]  # [..., T_obs, state_dim]
+        if state.shape[-1] != self.state_dim:
+            raise ValueError(f"state last dim must be {self.state_dim}, got {tuple(state.shape)}")
         T_obs = state.shape[-2]
         # Anchor selection. "first" = state at sample-start time (UMI / yam_openpi
         # convention; what the user-facing 32D-rel YAM config uses). "last" =
@@ -121,16 +130,18 @@ class Yam32DRelativeAction:
         base = state[..., anchor_idx, :]  # [..., 32]
 
         if "action" in batch:
-            action = batch["action"]["default"]  # [..., T_act, 32]
-            if action.shape[-1] != STATE_DIM:
-                raise ValueError(f"action last dim must be {STATE_DIM}, got {tuple(action.shape)}")
-            batch["action"]["default"] = self._encode(action, base, backward=backward)
+            action = batch["action"]["default"]  # [..., T_act, state_dim]
+            if action.shape[-1] != self.state_dim:
+                raise ValueError(f"action last dim must be {self.state_dim}, got {tuple(action.shape)}")
+            batch["action"]["default"] = self._encode(
+                action, base, backward=backward, joint_slice=self.joint_slice)
         # state is intentionally NOT modified — proprio stays absolute end-to-end.
         return batch
 
     @staticmethod
-    def _encode(action: torch.Tensor, base: torch.Tensor, *, backward: bool) -> torch.Tensor:
-        """action: torch [..., T_act, 32]; base: torch [..., 32] → torch [..., T_act, 32].
+    def _encode(action: torch.Tensor, base: torch.Tensor, *, backward: bool,
+                joint_slice: slice = _JOINT_SLICE) -> torch.Tensor:
+        """action: torch [..., T_act, D]; base: torch [..., D] → torch [..., T_act, D].
 
         Numpy round-trip (float64 internal) — keeps math byte-equivalent to yam_eef.py
         and yam_openpi's RelativeEEFActions / DeltaActions. Runs CPU-side in the dataloader
@@ -151,11 +162,12 @@ class Yam32DRelativeAction:
                 converted_T = base_T_b @ act_T                      # T_abs = T_base @ T_rel
             a64[..., sl] = mat_to_pose9d(converted_T)
 
-        # Joint scalar delta on slots [20:32]; gripper [18:20] untouched.
-        base_joint = b64[..., _JOINT_SLICE][..., None, :]           # [..., 1, 12]  (broadcast on T_act)
+        # Joint scalar delta on the joint block ([20:32] at 32D, [20:34] at 34D);
+        # gripper [18:20] untouched.
+        base_joint = b64[..., joint_slice][..., None, :]            # [..., 1, n_joint]  (broadcast on T_act)
         if not backward:
-            a64[..., _JOINT_SLICE] = a64[..., _JOINT_SLICE] - base_joint
+            a64[..., joint_slice] = a64[..., joint_slice] - base_joint
         else:
-            a64[..., _JOINT_SLICE] = a64[..., _JOINT_SLICE] + base_joint
+            a64[..., joint_slice] = a64[..., joint_slice] + base_joint
 
         return torch.from_numpy(a64).to(device=device, dtype=dtype)

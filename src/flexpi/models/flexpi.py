@@ -29,6 +29,7 @@ from .helpers.dino import (  # noqa: F401
     _zero_init_dino_x0_head_,
     compute_dino_freqs,
 )
+from .lora import mot_state_dict_for_save
 from .mot import MoT
 from .pointmap_encoder import PointmapEncoder
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -44,6 +45,58 @@ from flexpi.utils.pytorch_utils import _staged_randn
 from .backbone import FlexPiBackbone
 from .helpers.flex_joint import FlexJointConfig, sample_flex_batch_flags
 from .inference_opt.step_skip import StepSkipController, resolve_sim_sources
+
+
+def _mask_padded_action_dims(
+    noisy_action: torch.Tensor,
+    target_action: torch.Tensor,
+    action_dim_is_pad: Optional[torch.Tensor],
+) -> tuple:
+    """Zero the scatter-padded action channels on the DiT input AND the target.
+
+    ``training_target`` is ``noise - sample`` and ``ScatterToChannels`` writes
+    exact zeros into the unused slots, so without this every padded channel
+    carries unit-variance noise on the input and an unpredictable v-target.
+
+    This is half of the contract: the sampling paths zero the same channels
+    (``FlexPi._zero_padded_action``), otherwise training sees exact zeros
+    where inference feeds N(0,1).
+
+    No-op when ``action_dim_is_pad`` is absent, so dense pipelines are
+    bit-identical.
+    """
+    if action_dim_is_pad is None:
+        return noisy_action, target_action
+    dim_valid = (~action_dim_is_pad).to(noisy_action.dtype).unsqueeze(1)  # [B, 1, D]
+    return noisy_action * dim_valid, target_action * dim_valid
+
+
+def _action_mse_per_step(
+    pred_action: torch.Tensor,
+    target_action: torch.Tensor,
+    action_dim_is_pad: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """[B, T] action MSE averaged over the REAL channels only.
+
+    The bare ``.mean(2)`` this replaces divides by the full head width, not by
+    the channels the embodiment fills, so every real channel's gradient was
+    scaled by ``used/total``. The ``None`` branch is that previous behaviour,
+    unchanged and bit-identical.
+
+    ``total/used`` is only the asymptotic factor, reached once the head emits
+    ~0 on the padded channels; at initialisation the padded residual is the
+    same size as the real one and the two means nearly agree. On scattered
+    corpora ``loss.lambda_action`` is therefore not calibrated against its
+    old value.
+    """
+    per_el = F.mse_loss(
+        pred_action.float(), target_action.float(), reduction="none"
+    )  # [B, T, D]
+    if action_dim_is_pad is None:
+        return per_el.mean(2)
+    dim_valid = (~action_dim_is_pad).to(device=per_el.device, dtype=per_el.dtype)  # [B, D]
+    denom = dim_valid.sum(dim=-1).clamp(min=1.0).unsqueeze(1)  # [B, 1]
+    return (per_el * dim_valid.unsqueeze(1)).sum(dim=2) / denom
 
 
 class FlexPi(FlexPiBackbone):
@@ -146,6 +199,17 @@ class FlexPi(FlexPiBackbone):
         self.dino_dim = int(dino_dim)
         self.loss_lambda_dino = float(loss_lambda_dino)
         self.dino_temporal_stride = int(dino_temporal_stride)
+        # Set by set_action_dim_mask(); None keeps every sampling path unchanged.
+        self._action_dim_mask: Optional[torch.Tensor] = None
+        # Plain attributes, never buffers: whether a non-trivial pad mask reached
+        # this run's training loss (tri-state: None until the first training
+        # batch decides, so a resume that saves before running a step keeps
+        # "unknown" instead of stamping False; written into save_checkpoint's
+        # payload), and what the loaded checkpoint recorded (None when its
+        # payload predates the key or was itself unknown).
+        # helpers/action_pad.py turns them into the deploy decision.
+        self._action_dim_mask_trained: Optional[bool] = None
+        self.action_dim_mask_trained: Optional[bool] = None
         self.dino_stride_keep_far = bool(dino_stride_keep_far)
         self.dino_pred_x0 = bool(dino_pred_x0)
         if self.dino_pred_x0:
@@ -489,6 +553,18 @@ class FlexPi(FlexPiBackbone):
         ], dim=-1).reshape(f * h * w, 1, -1).to(device)
 
     def set_camera_intrinsics(self, camera_intrinsics: torch.Tensor) -> None:
+        """Cache a single fallback K for callers that do not pass one explicitly.
+
+        Deliberately collapses a batch axis: this cache is the "use these
+        intrinsics when none were supplied" default, read by single-sample
+        inference and val-visualisation paths, so one K per camera is the right
+        shape for it.
+
+        It is NOT the path per-episode intrinsics travel. Anything that must
+        honour per-sample calibration passes ``camera_intrinsics=`` explicitly
+        to ``encode_composite`` (as ``build_inputs`` does), which accepts
+        ``[B, num_cams, 3, 3]`` and unprojects each item with its own K.
+        """
         if camera_intrinsics.ndim == 4:
             camera_intrinsics = camera_intrinsics[0]
         self._camera_intrinsics = camera_intrinsics.to(device=self.device)
@@ -504,6 +580,48 @@ class FlexPi(FlexPiBackbone):
                 "`model.set_camera_intrinsics(K)` before inference."
             )
         return K
+
+    def set_action_dim_mask(self, action_dim_is_pad: Optional[torch.Tensor]) -> None:
+        """Register which action-head channels this embodiment does not fill.
+
+        ``[A]`` (or ``[B, A]``, first row taken) bool, True = padded. At
+        training the same mask arrives per-batch as ``sample['action_dim_is_pad']``
+        from ``ScatterToChannels``; at deploy there is no batch, so the server
+        sets it once from the config's ``used_action_channel_ids`` — the same
+        shape of thing ``set_camera_intrinsics`` does for K.
+
+        A plain attribute, never a buffer: it is not in ``state_dict`` and
+        leaving it unset keeps every sampling path bit-identical to before.
+        """
+        if action_dim_is_pad is None:
+            self._action_dim_mask = None
+            return
+        m = torch.as_tensor(action_dim_is_pad)
+        if m.ndim == 2:
+            m = m[0]
+        if m.ndim != 1:
+            raise ValueError(f"action_dim_is_pad must be [A] or [B, A]; got {tuple(m.shape)}")
+        width = int(self.action_expert.action_dim)
+        if int(m.shape[0]) != width:
+            raise ValueError(
+                f"action_dim_is_pad width {int(m.shape[0])} != action head width {width}"
+            )
+        self._action_dim_mask = m.to(device=self.device, dtype=torch.bool)
+
+    def _zero_padded_action(self, latents_action: torch.Tensor) -> torch.Tensor:
+        """Zero the padded channels of an action latent. No-op when unset.
+
+        Applied to the initial noise and after every scheduler step, so a padded
+        channel starts at exactly 0 and cannot drift. Training feeds exact 0 on
+        those channels and the loss masks them, so nothing else pulls an N(0,1)
+        start back onto the trained distribution.
+        """
+        m = getattr(self, "_action_dim_mask", None)
+        if m is None:
+            return latents_action
+        return latents_action * (~m).to(
+            device=latents_action.device, dtype=latents_action.dtype
+        )
 
     @torch.no_grad()
     def _encode_first_frame_pointmap_raw(
@@ -1130,6 +1248,19 @@ class FlexPi(FlexPiBackbone):
         t_action = self.train_action_scheduler.sample_training_t(B, self.device, action.dtype)
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, t_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, t_action)
+        action_dim_is_pad = inputs.get("action_dim_is_pad")
+        noisy_action, target_action = _mask_padded_action_dims(
+            noisy_action, target_action, action_dim_is_pad
+        )
+        if self._action_dim_mask_trained is not True:
+            # The checkpoint carries this so deploy arms the same mask. A batch
+            # with a padded channel settles it as True for good (no further
+            # .any() device sync); an unmasked batch only turns "unknown" into
+            # False, so a later padded batch in a mixed corpus can still flip it.
+            if action_dim_is_pad is not None and bool(action_dim_is_pad.any()):
+                self._action_dim_mask_trained = True
+            elif self._action_dim_mask_trained is None:
+                self._action_dim_mask_trained = False
 
         # --- DINO noise ---
         noise_dino = torch.randn_like(dino_features)
@@ -1280,7 +1411,7 @@ class FlexPi(FlexPiBackbone):
         )
 
         # --- Action loss ---
-        la = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(2)
+        la = _action_mse_per_step(pred_action, target_action, action_dim_is_pad)
         if action_is_pad is not None:
             v = (~action_is_pad).to(la.device, dtype=la.dtype)
             la = (la * v).sum(1) / v.sum(1).clamp(min=1.0)
@@ -1696,6 +1827,7 @@ class FlexPi(FlexPiBackbone):
             (1, action_horizon, self.action_expert.action_dim),
             generator=generator, device=rand_device, dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
+        latents_action = self._zero_padded_action(latents_action)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(
@@ -1866,6 +1998,7 @@ class FlexPi(FlexPiBackbone):
                 latents_action = self.infer_action_scheduler.step(
                     pred_action, step_delta, latents_action,
                 )
+                latents_action = self._zero_padded_action(latents_action)
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
@@ -2037,6 +2170,7 @@ class FlexPi(FlexPiBackbone):
             (1, action_horizon, self.action_expert.action_dim),
             generator=generator, device=rand_device, dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
+        latents_action = self._zero_padded_action(latents_action)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
 
@@ -2156,6 +2290,7 @@ class FlexPi(FlexPiBackbone):
             latents_action = self.infer_action_scheduler.step(
                 pred_action, step_delta, latents_action,
             )
+            latents_action = self._zero_padded_action(latents_action)
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
@@ -2254,6 +2389,7 @@ class FlexPi(FlexPiBackbone):
             (1, action_horizon, self.action_expert.action_dim),
             generator=action_gen, device=rand_device, dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
+        latents_action = self._zero_padded_action(latents_action)
 
         # --- Encode first-frame VAE ---
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
@@ -2392,6 +2528,7 @@ class FlexPi(FlexPiBackbone):
 
             latents_video = self.infer_video_scheduler.step(pred_video, dv, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action, da, latents_action)
+            latents_action = self._zero_padded_action(latents_action)
             latents_dino = self.infer_dino_scheduler.step(pred_dino, dd, latents_dino)
             if latents_pointmap is not None:
                 latents_pointmap = self.infer_pointmap_scheduler.step(
@@ -2484,10 +2621,13 @@ class FlexPi(FlexPiBackbone):
         return self._DINO_CKPT_KEYS
 
     def save_checkpoint(self, path, optimizer=None, step=None):
+        # A LoRA model saves merged: the stock `mot` keys and shapes, so every
+        # loader (resume weights-only, warm start, deploy) reads it unchanged.
         payload = {
-            "mot": self.mot.state_dict(),
+            "mot": mot_state_dict_for_save(self.mot),
             "step": step,
             "torch_dtype": str(self.torch_dtype),
+            "action_dim_mask_trained": self._action_dim_mask_trained,
         }
         for key in self._dino_ckpt_keys() + self._mode_ckpt_keys():
             payload[key] = getattr(self, key).state_dict()
@@ -2516,6 +2656,13 @@ class FlexPi(FlexPiBackbone):
                 "Checkpoint was saved with disable_video_stream=True (no video "
                 "stream). That mode no longer exists; refusing to load."
             )
+        # None on a checkpoint older than the key; helpers/action_pad.py falls
+        # back to the saved training config in that case.
+        self.action_dim_mask_trained = payload.get("action_dim_mask_trained")
+        logger.info(
+            "Checkpoint step=%s action_dim_mask_trained=%s",
+            payload.get("step"), self.action_dim_mask_trained,
+        )
         for key in self._dino_ckpt_keys() + self._mode_ckpt_keys():
             if key not in payload:
                 logger.warning("Checkpoint missing '%s'; keeping current params.", key)
@@ -3362,6 +3509,7 @@ class FlexPi(FlexPiBackbone):
             (1, action_horizon, self.action_expert.action_dim),
             action_gen, rand_device, self.device, self.torch_dtype,
         )
+        latents_action = self._zero_padded_action(latents_action)
 
         n_patches_dino = sum(h * w for h, w in self.dino_cam_patches)
         latents_dino = _staged_randn(
@@ -3641,6 +3789,7 @@ class FlexPi(FlexPiBackbone):
             latents_action = self.infer_action_scheduler.step(
                 pred_action, delta_a, latents_action, timestep=t_action,
             )
+            latents_action = self._zero_padded_action(latents_action)
             if self.joint_video:
                 latents_video = self.infer_video_scheduler.step(
                     pred_video, delta_v, latents_video, timestep=t_video,
@@ -3769,6 +3918,7 @@ class FlexPi(FlexPiBackbone):
             latents_action = self.infer_action_scheduler.step(
                 pred_action, deltas_action[i], latents_action,
             )
+            latents_action = self._zero_padded_action(latents_action)
             if self.joint_video:
                 latents_video = self.infer_video_scheduler.step(
                     pred_video, deltas_video[i], latents_video,

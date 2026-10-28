@@ -63,6 +63,12 @@ selected by a runtime flag.
 
 ## ✨ News
 
+- **[2026-10]** Two preview pretrained checkpoints,
+  [`flexpi-pretrain-preview`](https://huggingface.co/flex-pi/flexpi-pretrain-preview) and
+  [`flexpi-pretrain-rgb-preview`](https://huggingface.co/flex-pi/flexpi-pretrain-rgb-preview),
+  with zero-shot and fine-tuning guides, LoRA fine-tuning on one 24 GB GPU, the
+  34-D mixed-embodiment action space and a round of training and serving fixes —
+  [release notes](#-release-notes).
 - **[2026-08]** Code release — training, evaluation, and deployment, with
   [checkpoints](#-model-download) and [datasets](https://huggingface.co/flex-pi).
 - **[2026-08]** Flex-&pi; is out on [arXiv](https://arxiv.org/abs/2608.10860); see the
@@ -70,6 +76,7 @@ selected by a runtime flag.
 
 ## 📋 Table of Contents
 
+- [Release Notes](#-release-notes)
 - [Model Download](#-model-download)
 - [Requirements](#-requirements)
 - [Installation](#-installation)
@@ -84,16 +91,38 @@ selected by a runtime flag.
 - [Acknowledgements](#-acknowledgements)
 - [Citation](#-citation)
 
+## 📝 Release Notes
+
+**2026-10 — preview checkpoints, LoRA fine-tuning and the 34-D action space.**
+
+- **Two pretrained checkpoints (preview)** for bimanual YAM-family robots, served
+  zero-shot ([docs/PRETRAINED.md](docs/PRETRAINED.md)) or fine-tuned
+  ([docs/FINETUNE.md](docs/FINETUNE.md)), listed under [Model Download](#-model-download).
+  A stronger pretrained model will follow.
+- **LoRA fine-tuning on one 24 GB GPU**: `lora.enabled=true` freezes the 6 B
+  backbone and trains 68&ndash;82 M parameters, at a peak of 16&ndash;19 GiB on the
+  RoboTwin and YAM presets; saved weights are merged, so evaluation and serving
+  are unchanged ([docs/TRAINING.md §7](docs/TRAINING.md#7-lora-fine-tuning)).
+- **34-D mixed-embodiment action space**: one action head for 6- and 7-joint arms
+  with a per-sample pad mask, presets `yam34` / `agibot34`
+  ([docs/MIXED_EMBODIMENT_34D.md](docs/MIXED_EMBODIMENT_34D.md)).
+
 ## 📦 Model Download
 
-| Benchmark | Checkpoint | Trained on |
+| Target | Checkpoint | Trained on |
 |---|---|---|
 | RoboTwin 2.0 | [`flexpi-robotwin`](https://huggingface.co/flex-pi/flexpi-robotwin) | 50 tasks, 2,500 clean + 25,000 domain-randomized demos |
 | LIBERO | [`flexpi-libero`](https://huggingface.co/flex-pi/flexpi-libero) | all four suites, stream dropout at every `p` |
 | LIBERO | [`flexpi-libero-fulljoint-star`](https://huggingface.co/flex-pi/flexpi-libero-fulljoint-star) | all four suites, no dropout — always jointly denoised |
+| Bimanual YAM, pretrained (preview), RGB + DINO + depth | [`flexpi-pretrain-preview`](https://huggingface.co/flex-pi/flexpi-pretrain-preview) | ~4,600 hours of robot data |
+| Bimanual YAM, pretrained (preview), RGB + DINO | [`flexpi-pretrain-rgb-preview`](https://huggingface.co/flex-pi/flexpi-pretrain-rgb-preview) | ~4,100 hours of robot data |
 
-We plan to release large-scale checkpoints pre-trained on YAM, AgiBot World, and
-DROID. Stay tuned!
+The preview checkpoints run zero-shot on a bimanual YAM-family rig
+([docs/PRETRAINED.md](docs/PRETRAINED.md)) or as a starting point for fine-tuning
+([docs/FINETUNE.md](docs/FINETUNE.md)). `flexpi-pretrain-preview` trains on RGB +
+DINO + depth modalities (depth optional at inference; training depth is DA3 for
+ABC-130k, MolmoAct2 and AgiBot World, and sensor depth for the YAM data), and
+`flexpi-pretrain-rgb-preview` on RGB + DINO.
 
 ## 💻 Requirements
 
@@ -102,11 +131,14 @@ Linux x86_64, CUDA 12.8, Python 3.10.
 | Mode | Memory | GPUs |
 |---|---:|---|
 | Inference, deployment | 16&ndash;26 GB | 1 &times; RTX 4090 / 5090 |
-| Training | 80 GB each | 4&ndash;8 &times; A100 80GB / H100 / H200 |
+| LoRA fine-tuning | 24 GB | 1 &times; RTX 4090 / 5090, or any 24 GB+ card |
+| Full training and fine-tuning | 80 GB each | 4&ndash;8 &times; A100 80GB / H100 / H200 |
 
 Inference peaks are measured on an RTX 5090; the top of the range is the TensorRT
-stack. The launchers assume 8 GPUs; 4 is the floor, and proportionally slower. LoRA
-fine-tuning, which would lower that floor, is planned.
+stack. Full training: the launchers assume 8 GPUs; 4 is the floor, and
+proportionally slower. LoRA fine-tuning (`lora.enabled=true`,
+[docs/TRAINING.md §7](docs/TRAINING.md#7-lora-fine-tuning)) peaked at 16&ndash;19 GiB
+on the RoboTwin and YAM presets, measured on an A100 with memory capped at 22 GiB.
 
 ## 🔧 Installation
 
@@ -131,6 +163,9 @@ flex-pi/
 │   ├── LIBERO.md               # LIBERO 4-suite training + evaluation
 │   ├── ROBOTWIN.md             # RoboTwin 2.0 training + evaluation
 │   ├── YAM.md                  # real-world training + robot deployment
+│   ├── PRETRAINED.md           # the preview checkpoints, served zero-shot
+│   ├── FINETUNE.md             # fine-tuning the preview checkpoints
+│   ├── MIXED_EMBODIMENT_34D.md # one 34-D action head for 6- and 7-joint arms
 │   └── INFERENCE_OPTIMIZATION.md   # measured latency per stack + engine builds
 ├── src/flexpi/
 │   ├── models/
@@ -149,7 +184,8 @@ flex-pi/
 │   ├── model/flexpi.yaml        # architecture + flex_joint knobs
 │   ├── data/                    # dataset presets, one per benchmark
 │   │   ├── {robotwin,libero,yam}.yaml       # what the task configs select
-│   │   └── {robotwin,libero}_nodepth.yaml   # same, minus the depth stream
+│   │   ├── {robotwin,libero}_nodepth.yaml   # same, minus the depth stream
+│   │   └── {yam34,agibot34}.yaml            # the 34-D action layout (docs/MIXED_EMBODIMENT_34D.md)
 │   ├── task/                    # training presets (see table below)
 │   ├── train.yaml               # training defaults
 │   └── sim_{robotwin,libero}.yaml, real_yam.yaml   # evaluation defaults
@@ -160,12 +196,15 @@ flex-pi/
 │   ├── precompute_text_embeds.py
 │   ├── serve_yam_flexpi.py             # real-robot WebSocket policy server
 │   ├── serve_flexpi_yam.sh             # its launcher (edit config block, run)
+│   ├── render_prediction_dump.py       # renders the server's raw prediction dumps
+│   ├── test_rd_client_dummy.py         # no-robot client: round-trip latency against a server
+│   ├── norm_stats/                     # frame-pooled stats fitter
 │   ├── da3_depth/                      # add DA3 depth to an RGB-only dataset
 │   └── inference_opt/                  # TensorRT export + latency benchmarks
 ├── experiments/
 │   ├── robotwin/    # eval manager + RoboTwin policy wrapper
 │   ├── libero/      # eval entry points + 4-suite summariser
-│   └── yam/         # real-robot client, bridges, action smoothing
+│   └── yam/         # real-robot server side: policy, wire adapter, action smoothing
 └── third_party/
     ├── RoboTwin/    # vendored eval harness (see README.vendor.md)
     └── LIBERO/      # submodule
@@ -223,6 +262,15 @@ DATASET_DIRS="[./data/<your_yam_set>]" bash scripts/train_flexpi_yam.sh
 They default to 8 GPUs and write to
 `runs/<task_config>/<run_id>_<regime_tag>/` — the `config.yaml` and
 `dataset_stats.json` that evaluation reads back land there beside the checkpoints.
+
+`yam_unified_flex_3cam_34d_rel_1e-4` and `agibot_unified_flex_3cam_34d_1e-4`
+train the 34-D action layout ([docs/MIXED_EMBODIMENT_34D.md](docs/MIXED_EMBODIMENT_34D.md)).
+Fine-tuning a preview checkpoint ([docs/FINETUNE.md](docs/FINETUNE.md)):
+
+```bash
+TASK_CONFIG=yam_finetune_pretrain_preview_3cam_34d_rel_1e-4 \
+DATASET_DIRS="[./data/<your_yam_set>]" bash scripts/train_flexpi_yam.sh
+```
 
 Every knob and recipe is in **[docs/TRAINING.md](docs/TRAINING.md)**, and each
 benchmark has an end-to-end guide: **[RoboTwin](docs/ROBOTWIN.md)** &middot;
@@ -309,10 +357,14 @@ python scripts/serve_yam_flexpi.py \
 `scripts/serve_flexpi_yam.sh` wraps this with the regime
 (`--infer-joint-*` / `--infer-present-*`) and TensorRT knobs already wired up.
 
-The msgpack wire contract a client must speak, and the reference bridge, live in
+The preview checkpoints serve through the same server; their regimes and input
+contract are in [docs/PRETRAINED.md](docs/PRETRAINED.md).
+
+The msgpack wire contract a client must speak is in [docs/YAM.md](docs/YAM.md);
+the server-side code lives in
 [`experiments/yam/flexpi_policy/`](experiments/yam/flexpi_policy/).
-[docs/YAM.md](docs/YAM.md) covers the three serving configurations, that wire
-contract, and the rules that have caused emergency stops on real hardware.
+[docs/YAM.md](docs/YAM.md) also covers the three serving configurations and the
+rules that have caused emergency stops on real hardware.
 
 ## ⚡ Inference Optimization
 
@@ -322,7 +374,7 @@ denoise steps:
 | Stack | full joint | action only |
 |---|---:|---:|
 | eager PyTorch | 447 | 132 |
-| **torch.compile** — the default | 360 | **60** |
+| **torch.compile** — the default of the RoboTwin eval launchers | 360 | **60** |
 | + TensorRT joint engine | 230 | — |
 | **+ TensorRT KV-split engines** | **193** | — |
 
@@ -336,6 +388,11 @@ engine builds and the server knobs.
 MIT — see [LICENSE](LICENSE). Vendored third-party code keeps its own
 license; see `third_party/*/README.vendor.md`.
 
+The released checkpoints, the two previews included, are MIT as well. Their
+training data keeps its own terms: ABC-130k and MolmoAct2 are Apache-2.0; AgiBot
+World (in `flexpi-pretrain-preview` only) is gated under CC BY-NC-SA 4.0. The flex-pi
+YAM datasets are CC BY 4.0. DINOv3 has its own license.
+
 ## 🙏 Acknowledgements
 
 Flex-&pi; builds on [Wan2.2](https://github.com/Wan-Video/Wan2.2) for the video
@@ -345,6 +402,8 @@ for pointmap annotation. The RoboTwin evaluation harness is adapted from the
 [RoboTwin](https://github.com/RoboTwin-Platform/RoboTwin) repository, and the
 codebase inherits structure from
 [Fast-WAM](https://github.com/yuantianyuan01/FastWAM). Pre-training data comes from
+[ABC-130k](https://huggingface.co/datasets/XDOF/ABC-130k),
+[MolmoAct2](https://huggingface.co/datasets/allenai/MolmoAct2-BimanualYAM-Dataset) and
 [AgiBot World](https://github.com/OpenDriveLab/AgiBot-World), and the real-robot
 YAM data collection and control run on
 [raiden](https://github.com/TRI-ML/raiden). We thank all of these teams for

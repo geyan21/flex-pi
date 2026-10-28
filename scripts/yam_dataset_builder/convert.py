@@ -18,6 +18,10 @@ numerically equivalent (up to float32 noise) to a dataset built by
     resize uses linspace-endpoint nearest-NN (openpi convention).
   - ``meta/camera_intrinsics.json`` rescaled with the "endpoint" convention
     ``s = (dst-1)/(src-1)`` and averaged across all episodes (matches openpi).
+  - ``meta/episode_intrinsics.jsonl`` — the same K's before averaging, one
+    record per episode. The loader prefers it, which keeps metric depth correct
+    when a build spans rigs with different optics; the averaged file above
+    stays for tools that predate it.
 
 Example (single source):
     python scripts/yam_dataset_builder/convert.py \\
@@ -184,7 +188,11 @@ def _ffmpeg_encode_rgb(
         and target_w is not None
         and (int(target_h), int(target_w)) != (H_src, W_src)
     ):
-        cmd += ["-vf", f"scale={int(target_w)}:{int(target_h)}:flags=bilinear"]
+        # setsar=1: scale preserves the DISPLAY aspect ratio by writing a
+        # compensating SAR, which would make players render the file at a size
+        # that disagrees with its coded resolution and with the depth stream.
+        # A no-op when the resize keeps the aspect ratio; correct when it does not.
+        cmd += ["-vf", f"scale={int(target_w)}:{int(target_h)}:flags=bilinear,setsar=1"]
     cmd += [
         "-c:v", rgb_codec, "-pix_fmt", RGB_PIX_FMT,
         "-g", str(gop), "-crf", str(crf),
@@ -598,12 +606,14 @@ def convert(
     sx = _endpoint_scale(W_first, W_raw_first)
     sy = _endpoint_scale(H_first, H_raw_first)
 
-    # Average per-cam K across ALL episodes (matches openpi). Each worker
-    # reports K at SOURCE resolution; we rescale then average. A large
-    # per-cell drift around the mean is logged but does not abort — a build
-    # that spans a ZED re-mount mid-dataset is still finishable; the user just
-    # needs to know.
+    # Rescale each episode's K to the output grid, then keep BOTH forms: the
+    # per-episode table (meta/episode_intrinsics.jsonl, the accurate one) and
+    # the across-episode mean (meta/camera_intrinsics.json, kept for datasets
+    # and tools that predate the per-episode table). A large per-cell drift
+    # around the mean is logged but does not abort — a build that spans a ZED
+    # re-mount mid-dataset is still finishable; the user just needs to know.
     per_cam_K_stack: dict[str, list[np.ndarray]] = {cam: [] for cam in results[0]["intrinsic"]}
+    per_episode_K: dict[int, dict[str, np.ndarray]] = {}
     for r in results:
         if (
             r.get("W_raw", W_raw_first) != W_raw_first
@@ -618,6 +628,7 @@ def convert(
             ep_sy = _endpoint_scale(H_first, r.get("H_raw", H_raw_first))
         else:
             ep_sx, ep_sy = sx, sy
+        ep_K: dict[str, np.ndarray] = {}
         for cam, arr in r["intrinsic"].items():
             K = np.asarray(arr, dtype=np.float64).copy()
             K[0, 0] *= ep_sx  # fx
@@ -625,6 +636,8 @@ def convert(
             K[1, 1] *= ep_sy  # fy
             K[1, 2] *= ep_sy  # cy
             per_cam_K_stack[cam].append(K)
+            ep_K[cam] = K
+        per_episode_K[int(r["new_ep_idx"])] = ep_K
 
     first_ep_intrinsics: dict[str, np.ndarray] = {}
     for cam, ks in per_cam_K_stack.items():
@@ -651,15 +664,30 @@ def convert(
         for rec in episodes_stats_records:
             fh.write(json.dumps(rec) + "\n")
 
-    cam_intrinsics = {}
-    for cam, K in first_ep_intrinsics.items():
-        cam_intrinsics[cam] = {
+    def _k_entry(K: np.ndarray) -> dict:
+        return {
             "fx": float(K[0, 0]), "fy": float(K[1, 1]),
             "cx": float(K[0, 2]), "cy": float(K[1, 2]),
             "width": int(W_first), "height": int(H_first),
         }
+
+    cam_intrinsics = {cam: _k_entry(K) for cam, K in first_ep_intrinsics.items()}
     with (out_dir / "meta" / "camera_intrinsics.json").open("w") as fh:
         json.dump(cam_intrinsics, fh, indent=2)
+
+    # Per-episode intrinsics. Same units, same grid and same endpoint rescale as
+    # camera_intrinsics.json — only the granularity differs. The loader prefers
+    # this file and silently falls back to the mean when it is absent, so older
+    # datasets keep working and a rebuild is not required.
+    with (out_dir / "meta" / "episode_intrinsics.jsonl").open("w") as fh:
+        for ep_idx in sorted(per_episode_K):
+            fh.write(json.dumps({
+                "episode_index": ep_idx,
+                "intrinsics": {
+                    cam: _k_entry(K) for cam, K in per_episode_K[ep_idx].items()
+                },
+            }) + "\n")
+    print(f"[info] wrote per-episode intrinsics for {len(per_episode_K)} episodes")
 
     # ---- info.json ---------------------------------------------------------
     state_dim = layout.state_dim

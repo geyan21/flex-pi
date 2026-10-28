@@ -39,6 +39,7 @@ EVALUATION:
   negative_prompt: ""
   rand_device: cpu
   tiled: false
+  action_dim_mask: null  # null = arm the padded-channel mask iff the checkpoint trained with it; true/false forces
 
   # Inference optimization
   torch_compile: false

@@ -31,6 +31,7 @@ EVALUATION:
   negative_prompt: ""
   rand_device: cpu
   tiled: false
+  action_dim_mask: null  # null = arm the padded-channel mask iff the checkpoint trained with it; true/false forces
   offload_text_encoder: false  # move T5 to CPU between calls to save ~10GB VRAM
   timing_enabled: false
   skip_get_obs_within_replan: true

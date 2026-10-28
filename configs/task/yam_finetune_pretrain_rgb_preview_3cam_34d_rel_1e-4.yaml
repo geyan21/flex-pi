@@ -1,0 +1,59 @@
+# @package _global_
+#
+# FlexPi (flex_joint) — YAM fine-tune from flex-pi/flexpi-pretrain-rgb-preview
+# (RGB only, 34D head with pad slots 26/33). The data chain is
+# yam_unified_flex_3cam_34d_rel_1e-4's (yam34: Yam32DRelativeAction, 32-wide
+# normalizer, 32 -> 34 scatter); the model block and the norm stats follow
+# the checkpoint:
+#   - the checkpoint's own 32-wide frame-pooled q01/q99 stats;
+#   - action targets unclamped (action_norm_clamp .inf), as the checkpoint
+#     trained them under those stats;
+#   - no depth: shape_meta.depth is null, so the loader reads RGB only, and
+#     the pointmap stream is globally off (p_present_pointmap = p_jp = 0,
+#     cross_modal_predict_pointmap false), as the checkpoint never trained it;
+#   - DINO temporal stride 2 keep-far, MoT gradient checkpointing on.
+# scripts/train_flexpi_yam.sh passes a FLEX_P_* knob as an override only when
+# it is set, so the pointmap flags below apply unless FLEX_P_PRESENT_POINTMAP
+# or FLEX_P_JP is set. The warm start loads strictly: a shape mismatch is an
+# error rather than a silent re-init. The default pretrained_ckpt is the
+# download location in docs/FINETUNE.md. See docs/FINETUNE.md.
+
+defaults:
+  - override /data: yam34
+  - override /model: flexpi
+  - _self_
+
+batch_size: 9
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: true
+  dino_temporal_stride: 2
+  dino_stride_keep_far: true
+  joint_pointmap: false
+  flex_joint:
+    p_present_pointmap: 0.0
+    p_jp: 0.0
+    cross_modal_predict_pointmap: false
+
+data:
+  train:
+    concat_multi_camera: ${model.composite_layout}
+    pretrained_norm_stats: ./checkpoints/flexpi-pretrain-rgb-preview/dataset_stats.json
+    processor:
+      action_norm_clamp: .inf
+    shape_meta:
+      depth: null
+
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 2
+save_every: 1000
+eval_every: 1000
+
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+pretrained_ckpt: ./checkpoints/flexpi-pretrain-rgb-preview/checkpoints/weights/model.pt
+pretrained_ckpt_strict_shape: true

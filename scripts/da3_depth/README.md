@@ -91,6 +91,11 @@ off the files actually written.
 > nothing validates it:** a wrong K yields a perfectly plausible depth map that
 > is simply the wrong size in metres, with no error anywhere.
 
+If the dataset ships `meta/episode_intrinsics.jsonl`, each episode is scaled by
+its own K, and `--check` prints the per-episode focal spread; an episode missing
+from the table is an error at planning time. The focal is baked into the
+millimetres written here, so a wrong K at this stage is not undone at training.
+
 The depth grid is the resolution DA3 runs at and the depth is written at. It
 defaults to **each camera's own native RGB resolution**, probed per camera —
 which preserves the aspect ratio DA3's geometry depends on, and makes the K

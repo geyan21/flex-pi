@@ -68,7 +68,6 @@ from experiments.yam.flexpi_policy.server_speed import (  # noqa: E402
 from experiments.yam.flexpi_policy._openpi_vendor.websocket_policy_server import (  # noqa: E402
     WebsocketPolicyServer,
 )
-from flexpi.datasets.lerobot.robot_video_dataset import _PER_CAM_HW  # noqa: E402
 
 
 LOG_PREFIX = "[serve_yam_flexpi]"
@@ -78,10 +77,10 @@ class _SessionAwareWebsocketServer(WebsocketPolicyServer):
     """``WebsocketPolicyServer`` that fires ``start_session`` / ``end_session``
     on the underlying policy when a WS connection opens / closes.
 
-    Used to scope per-session work to one bridge run: the bridge
-    `rd infer` invocation establishes a connection; ctrl+c on the bridge
-    closes it; the policy's session hooks fire in between (session-timer
-    reset + final elapsed echo, ``PredictionRecorder`` open/close, etc.).
+    Used to scope per-session work to one client run: the client
+    establishes a connection when it starts and closes it when it stops; the
+    policy's session hooks fire in between (session-timer reset + final
+    elapsed echo, ``PredictionRecorder`` open/close, etc.).
 
     Falls back to the parent's behavior when the policy doesn't expose
     ``start_session`` (defensive no-op).
@@ -92,9 +91,14 @@ class _SessionAwareWebsocketServer(WebsocketPolicyServer):
         remote = str(getattr(websocket, "remote_address", ""))
         start_fn = getattr(self._policy, "start_session", None)
         end_fn = getattr(self._policy, "end_session", None)
+        # Session token: passed back to end_session so a stale handler (dead
+        # bridge whose task only sees the drop after keepalive expiry, after a
+        # replacement bridge already reconnected) can't tear down the newer
+        # session's recorder. None = start failed -> nothing of ours to end.
+        token = None
         if callable(start_fn):
             try:
-                start_fn(remote_addr=remote)
+                token = start_fn(remote_addr=remote)
             except Exception as e:  # noqa: BLE001
                 # A failed start_session must not block serving — log and
                 # continue without recording.
@@ -104,9 +108,9 @@ class _SessionAwareWebsocketServer(WebsocketPolicyServer):
         try:
             await super()._handler(websocket)
         finally:
-            if callable(end_fn):
+            if callable(end_fn) and token is not None:
                 try:
-                    end_fn()
+                    end_fn(token=token)
                 except Exception as e:  # noqa: BLE001
                     logging.getLogger(__name__).warning(
                         "end_session() failed: %r", e,
@@ -219,32 +223,55 @@ def _build_parser() -> argparse.ArgumentParser:
         "--record-predictions-dir", default=None,
         help="When set, every chunk forces the joint-denoise regime "
              "(joint_video=joint_dino=joint_pointmap=True) and the server "
-             "appends the decoded RGB + DINO PCA + pointmap PCA rows to an "
-             "MP4 under <dir>/<timestamp>_<remote>/prediction.mp4. Each WS "
-             "connection (= each `rd infer` invocation) gets its own subdir; "
-             "ctrl+c on the bridge disconnects the WS and the server "
-             "finalizes the file. Joint denoise is ~3x slower than the "
-             "fast action-only path — the robot will visibly stall between "
-             "chunks.",
+             "records the model's predicted future per chunk under "
+             "<dir>/<timestamp>_<remote>/ — how depends on "
+             "--record-predictions-mode (default: raw tensor dump, rendered "
+             "post-hoc). Each WS connection (= each client run) "
+             "gets its own subdir; stopping the client disconnects the WS "
+             "and the server finalizes the session. Joint denoise itself is "
+             "~3x slower than the fast action-only path.",
     )
     p.add_argument(
-        "--record-predictions-fps", type=int, default=8,
-        help="MP4 playback FPS for the recording. Matches the trainer "
-             "eval-video default of 8 (slow-motion relative to 32hz "
-             "predicted future). Bump to 32 for real-time-ish playback.",
+        "--record-predictions-mode", default="raw", choices=["raw", "live"],
+        help="raw (default) = append_chunk only CPU-copies the pred latents "
+             "+ present inputs and hands them to a background writer thread "
+             "(torch.save -> <session>/raw_chunks/chunk_%%05d.pt); no VAE "
+             "decode, no PCA, no mp4 encode in the control loop. "
+             "scripts/render_prediction_dump.py --dump-dir <session> "
+             "renders it afterwards; the settings below are recorded in "
+             "meta.json as its defaults and can be overridden there. "
+             "live = legacy in-loop rendering; adds the full render + encode "
+             "cost to every chunk (measured on an A100 host, 4 denoise "
+             "steps: about 0.77 s per chunk, 4.7 s on the chunk that closes "
+             "the PCA warm-up; raw mode adds about 18 ms).",
+    )
+    p.add_argument(
+        "--record-predictions-fps", type=float, default=7.5,
+        help="MP4 playback FPS. Default 7.5 = the deploy-correct rate: "
+             "predicted frames are action_video_freq_ratio (4) action steps "
+             "apart at action_hz (30), so real spacing is 4/30 s. With the "
+             "default anchor drop, chunks then tile seamlessly in wall-clock "
+             "when chunk_size == action_horizon. (The old trainer-eval "
+             "default of 8 drifts ~6%% fast.)",
     )
     p.add_argument(
         "--record-predictions-frames-per-chunk", type=int, default=0,
-        help="When > 0, keep only the first N decoded frames per chunk in "
-             "prediction.mp4 instead of all ~9. Use this to align chunk "
-             "boundaries seamlessly: each chunk's prediction covers ~0.66 s "
-             "of model-imagined future but only chunk_size/action_horizon of "
-             "it (~0.27 s for the YAM defaults of chunk_size=8, "
-             "action_horizon=32) actually elapses before the next chunk "
-             "fires. Pick N = ceil(F_dec * chunk_size / action_horizon) — "
-             "with the YAM defaults that's 2 or 3. Default 0 = keep all 9 "
-             "frames per chunk (the original training-eval-style layout, "
-             "with the visible per-chunk anchor pattern).",
+        help="When > 0, keep only the first N frames of each chunk's kept "
+             "window (which starts after the dropped anchor frame unless "
+             "--record-predictions-keep-anchor). Default 0 = the whole "
+             "window — with the anchor dropped that is all 8 imagined "
+             "frames on the standard 33-frame ckpts, seamless at 7.5 fps "
+             "when chunk_size == action_horizon. For a bridge replanning "
+             "every R actions, N = R/action_video_freq_ratio tiles seamlessly.",
+    )
+    p.add_argument(
+        "--record-predictions-keep-anchor", action="store_true",
+        help="Keep each chunk's decoded frame 0. Frame 0 is the re-clamped "
+             "clean reconstruction of the CURRENT real observation, so by "
+             "default it is dropped: it duplicates the previous chunk's last "
+             "instant and snaps the imagined scene (training-style "
+             "background) back to reality once per chunk. Keeping it "
+             "restores the old 9-frames-per-chunk layout.",
     )
     p.add_argument(
         "--record-predictions-pca-warmup-chunks", type=int, default=3,
@@ -254,6 +281,19 @@ def _build_parser() -> argparse.ArgumentParser:
              "across chunks (otherwise each chunk re-fits and the same "
              "feature shows different colors). The first N chunks are "
              "buffered and written once the warmup window closes. Default 3.",
+    )
+    p.add_argument(
+        "--record-predictions-split", default="none",
+        choices=["none", "row", "tile"],
+        help="Also write companion MP4s next to prediction.mp4 so rows and "
+             "columns can be cut independently. 'row' = one file per row "
+             "(rgb, dino, pointmap_xyz, pointmap_depth, pointmap_vae_pca, "
+             "rgb_vae_pca). 'tile' = one file per cell, <row>__<col>.mp4 "
+             "(e.g. rgb__pred / rgb__vae_recon / rgb__gt, dino__pred_pca / "
+             "dino__gt_pca / dino__gt_norm) — up to 18 files. Split files are "
+             "cut at native width before the panel resize, so they are never "
+             "resampled, and share the panel's fps/frame budget/PCA stats. "
+             "Default none (panel only).",
     )
     return p
 
@@ -273,17 +313,26 @@ def _log_vram(stage: str) -> None:
         print(f"{LOG_PREFIX} VRAM probe failed ({exc!r}); continuing.")
 
 
-def _synthesize_prewarm_obs() -> dict:
-    """A zero-filled flat obs at exactly the wire shapes the server expects."""
+def _synthesize_prewarm_obs(per_cam_hw: dict) -> dict:
+    """A synthetic flat obs at exactly the wire shapes the server expects
+    (``per_cam_hw`` as the server's metadata advertises it): zero RGB and
+    depth, a placeholder K, and a zero state except for its two rot6d blocks.
+
+    Those are identity, ``[1, 0, 0, 0, 1, 0]`` (the first two rows of R): an
+    all-zero rotation has no orthonormal frame, and the relative-action
+    inverse turns it into NaN in every EEF dim.
+    """
     obs: dict = {}
-    for cam, (h, w) in _PER_CAM_HW:
+    for cam, (h, w) in per_cam_hw.items():
         obs[f"observation/image_{cam}"] = np.zeros((h, w, 3), dtype=np.uint8)
         obs[f"observation/depth_{cam}"] = np.zeros((h, w), dtype=np.uint16)
         # Sane K placeholder so set_camera_intrinsics has a real matrix to use.
         obs[f"observation/intrinsics_{cam}"] = np.array(
             [200.0, 200.0, w / 2.0, h / 2.0], dtype=np.float32,
         )
-    obs["observation/state"] = np.zeros(32, dtype=np.float32)
+    state = np.zeros(32, dtype=np.float32)
+    state[3:9] = state[12:18] = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    obs["observation/state"] = state
     obs["prompt"] = "warmup"
     return obs
 
@@ -302,7 +351,7 @@ def _verify_split_engine_provenance(prefill: str, decode: str, ckpt_path: str) -
     rather than refusing -- the pairing may well be correct, and refusing would
     strand every pre-existing engine dir.
     """
-    ckpt = Path(ckpt_path).expanduser().resolve()
+    ckpt = Path(ckpt_path).expanduser().absolute()
     for role, engine in (("prefill", prefill), ("decode", decode)):
         meta_path = Path(engine).expanduser().resolve().parent / "build_meta.json"
         if not meta_path.is_file():
@@ -427,17 +476,25 @@ def main() -> int:
         record_fps=args.record_predictions_fps,
         record_frames_per_chunk=args.record_predictions_frames_per_chunk,
         record_pca_warmup_chunks=args.record_predictions_pca_warmup_chunks,
+        record_split=args.record_predictions_split,
+        record_mode=args.record_predictions_mode,
+        record_drop_anchor=not args.record_predictions_keep_anchor,
+        record_ckpt_path=args.ckpt_path,
     )
 
     if not args.no_prewarm:
         print(f"{LOG_PREFIX} prewarm: synthesizing dummy obs and running one infer...")
-        prewarm_obs = _synthesize_prewarm_obs()
+        prewarm_obs = _synthesize_prewarm_obs(server_policy.metadata["per_cam_hw"])
         t0 = time.perf_counter()
         out = server_policy.infer(prewarm_obs)
         prewarm_s = time.perf_counter() - t0
         assert out["actions"].shape == (policy.action_horizon, 32), (
             f"prewarm action shape {out['actions'].shape} != expected "
             f"({policy.action_horizon}, 32)"
+        )
+        assert np.isfinite(out["actions"]).all(), (
+            f"prewarm actions are not finite: "
+            f"{int((~np.isfinite(out['actions'])).sum())} of {out['actions'].size} entries"
         )
         print(f"{LOG_PREFIX} PREWARM DONE in {prewarm_s:.1f} s "
               f"(actions shape={out['actions'].shape})")
@@ -448,9 +505,17 @@ def main() -> int:
     if args.record_predictions_dir:
         print(
             f"{LOG_PREFIX} prediction recording ON  dir={args.record_predictions_dir}  "
-            f"fps={args.record_predictions_fps}  (joint-denoise regime forced; "
-            "expect ~3x slowdown per chunk)"
+            f"mode={args.record_predictions_mode}  fps={args.record_predictions_fps:g}  "
+            f"split={args.record_predictions_split}  "
+            f"drop_anchor={not args.record_predictions_keep_anchor}  "
+            "(joint-denoise regime forced)"
         )
+        if args.record_predictions_mode == "raw":
+            print(
+                f"{LOG_PREFIX} raw dump mode: no in-loop rendering. After the "
+                "session, render with:  python scripts/render_prediction_dump.py "
+                "--dump-dir <session_dir>"
+            )
     # Always use the session-aware subclass so the session timer (first
     # action → disconnect) runs whether or not recording is enabled; the
     # extra cost is one call to ``start_session`` / ``end_session`` per WS

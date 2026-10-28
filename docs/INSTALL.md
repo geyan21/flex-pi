@@ -1,7 +1,9 @@
 # Installation
 
 Linux x86_64, CUDA 12.8, Python 3.10. One 32 GB GPU runs inference, evaluation
-and deployment; training needs A100/H100/H200-class cards.
+and deployment; LoRA fine-tuning fits one 24 GB GPU
+([`TRAINING.md §7`](TRAINING.md#7-lora-fine-tuning)); full training needs
+A100/H100/H200-class cards.
 
 In order:
 

@@ -1,0 +1,35 @@
+# @package _global_
+#
+# FlexPi (flex_joint) — YAM real-world bimanual in the 34D layout: the sibling
+# of yam_unified_flex_3cam_32d_rel_1e-4 with action/state scattered into the
+# AgiBot 34D layout (7-joint blocks per arm; YAM's absent 7th joints are pad
+# slots 26/33, masked out of the loss). Same YAM data, same `action_rep="rel"`
+# recipe, unchanged 32-wide norm stats (normalization runs before the
+# scatter). The action head matches AgiBot-34D, so an AgiBot 34D pretrain
+# warm-inits it unchanged. See docs/YAM.md.
+
+defaults:
+  - override /data: yam34
+  - override /model: flexpi
+  - _self_
+
+batch_size: 9
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+data:
+  train:
+    concat_multi_camera: ${model.composite_layout}
+
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 2
+save_every: 1000
+eval_every: 1000
+
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null

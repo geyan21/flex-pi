@@ -26,11 +26,19 @@ fi
 
 NUM_SHARDS="${NUM_SHARDS:-1}"
 SHARD_ID="${SHARD_ID:-0}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
+# `auto` = the largest the VRAM budget allows for this dataset's biggest
+# grid. The old default of 16 is REFUSED on 1920x1200 (the budget allows 3), so
+# any driver spanning several native resolutions died at the largest grid;
+# no single constant fits them all.
+BATCH_SIZE="${BATCH_SIZE:-auto}"
 
 # --check and --patch-info-only need neither GPU nor checkpoint.
 if [[ "${CHECK:-0}" == "1" ]]; then
-  exec "${DA3_PY}" "${PY_SCRIPT}" --dataset-dir "${DS}" --check "${@:2}"
+  # --batch-size too: the check exists to catch a VRAM-budget refusal BEFORE a GPU
+  # run, and it cannot do that while the planner sees argparse's default
+  # instead of the batch size the real run will use.
+  exec "${DA3_PY}" "${PY_SCRIPT}" --dataset-dir "${DS}" --check \
+       --batch-size "${BATCH_SIZE}" "${@:2}"
 fi
 if [[ "${PATCH_INFO_ONLY:-0}" == "1" ]]; then
   exec "${DA3_PY}" "${PY_SCRIPT}" --dataset-dir "${DS}" --patch-info-only "${@:2}"

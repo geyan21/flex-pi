@@ -301,7 +301,8 @@ def _maybe_swap_with_saved_config(cfg: DictConfig) -> DictConfig:
     Controlled by `cfg.resume_config_source`:
       - "current" (default): no-op, return cfg as-is.
       - "saved": load <run_dir>/config.yaml from phase-1, replace cfg verbatim,
-        then force-inject current launch-time fields (output_dir, wandb, resume)
+        then force-inject current launch-time fields (output_dir, wandb, resume,
+        max_grad_norm)
         so the new launch writes to its own dir / wandb run while otherwise
         reproducing phase-1 exactly.
       - "saved_with_overrides": "saved" + apply current Hydra CLI leaf overrides
@@ -348,9 +349,25 @@ def _maybe_swap_with_saved_config(cfg: DictConfig) -> DictConfig:
     # and points at phase-1's output_dir / wandb run; we want the new launch
     # to write to its own dir and have the user's current wandb settings.
     saved_cfg.resume = cfg.resume
+    # The resume restores this run, so the warm start it was launched with no
+    # longer applies (the trainer refuses both at once).
+    saved_cfg.pretrained_ckpt = None
     saved_cfg.output_dir = cfg.output_dir
     if "wandb" in cfg:
         saved_cfg.wandb = OmegaConf.to_container(cfg.wandb, resolve=True)
+
+    # max_grad_norm is launch-time too: the saved snapshots all say 1.0 but their
+    # runs trained unclipped, because the knob did not reach DeepSpeed before
+    # 2026-09-10. Carrying it forward would start clipping mid-run, which is the
+    # opposite of what this mode is for (docs/TRAINING.md §6).
+    if (saved_cfg.get("max_grad_norm") or 0.0) != (cfg.get("max_grad_norm") or 0.0):
+        logger.warning(
+            "resume_config_source=%s: using max_grad_norm=%s from the current cfg, "
+            "not %s from the saved one — the saved value predates the fix that made "
+            "this knob reach DeepSpeed, so phase 1 trained unclipped.",
+            source, cfg.max_grad_norm, saved_cfg.get("max_grad_norm", None),
+        )
+    saved_cfg.max_grad_norm = cfg.max_grad_norm
 
     # Carry the meta-flag through so any downstream readers see consistent
     # values (the saved cfg pre-dates this field for old runs).

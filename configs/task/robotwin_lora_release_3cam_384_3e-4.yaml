@@ -1,0 +1,54 @@
+# @package _global_
+#
+# FlexPi LoRA fine-tune of the released flex-pi/flexpi-robotwin checkpoint
+# (step_048060) on one GPU. The model block is that checkpoint's geometry, which
+# predates the uniform T layout of robotwin_unified_flex_3cam_384_1e-4: with
+# composite_layout / dino_pixel_unshuffle / dino_pred_x0 / dino_stride_keep_far
+# as below, the composed model block equals the checkpoint's config.yaml (the
+# other values would re-initialize the DINO heads, and dino_pred_x0 changes no
+# shape, so no shape check can see it). The warm start loads strictly.
+#
+# LoRA (configs/train.yaml `lora:`): the MoT is frozen and rank-16 adapters
+# train on every attention and FFN Linear of both experts; everything outside
+# the MoT trains as in a full fine-tune. MoT gradient checkpointing is on;
+# batch 1 x 32 accumulation is a global batch of 32 on one card (20 GiB on an
+# A100). Memory and speed: docs/TRAINING.md §7.
+
+defaults:
+  - override /data: robotwin
+  - override /model: flexpi
+  - _self_
+
+batch_size: 1
+gradient_accumulation_steps: 32
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: true
+  composite_layout: null
+  dino_pixel_unshuffle: 0
+  dino_pred_x0: false
+  dino_stride_keep_far: false
+
+data:
+  train:
+    concat_multi_camera: ${model.composite_layout}
+  val:
+    concat_multi_camera: ${model.composite_layout}
+
+lora:
+  enabled: true
+
+learning_rate: 3e-4
+weight_decay: 1e-2
+num_epochs: 1
+max_steps: 2500
+log_every: 10
+save_every: 500
+eval_every: 500
+keep_last_n_states: 1
+keep_last_n_weights: 2
+
+resume: null
+pretrained_ckpt: ./runs/flexpi-robotwin/checkpoints/weights/step_048060.pt  # the model card's download location
+pretrained_ckpt_strict_shape: true

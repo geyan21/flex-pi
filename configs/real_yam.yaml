@@ -36,8 +36,10 @@ EVALUATION:
   replan_steps: 32
 
   # Inference optimization.
-  torch_compile: true
+  torch_compile: false  # the validated 34-D deploy ran eager; inductor compile hung at startup
   torch_compile_mode: "reduce-overhead"  # default, reduce-overhead, max-autotune
   quantization: null  # null, "int8" (weight-only) or "fp8" (dynamic act+weight, SM89+)
 
   dynamic_step_skip: false
+
+  action_dim_mask: null  # null = arm the padded-channel mask iff the checkpoint trained with it; true/false forces

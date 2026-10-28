@@ -2,8 +2,13 @@
 # =============================================================================
 # FlexPi — YAM real-robot WebSocket policy server.
 #
-# Serves action chunks over websocket to a raiden bridge. Set SPLIT_DIR to use
-# TensorRT engines, or leave it empty for torch.compile.
+# Serves action chunks over websocket to a robot client. Set SPLIT_DIR to use
+# TensorRT engines, or leave it empty for the engine-free stack (eager unless
+# TORCH_COMPILE=true).
+#
+# The shipped INFER_* values serve full joint with the pointmap stream present,
+# which needs the client to send depth and intrinsics. docs/YAM.md template D
+# (no depth) is INFER_PRESENT_POINTMAP=false with the three INFER_JOINT_*=false.
 #
 # Edit the config block below, then: bash scripts/serve_flexpi_yam.sh
 # Details: docs/YAM.md · docs/INFERENCE_OPTIMIZATION.md §3 (the server takes a
@@ -47,7 +52,7 @@ ATTN_BACKEND=auto                    # sdpa | flex | auto
 
 # ── Acceleration ──────────────────────────────────────────────────────────────
 # Engine-free stack only (ignored when SPLIT_DIR is set).
-TORCH_COMPILE=true
+TORCH_COMPILE=false                  # real_yam.yaml default: the validated 34-D deploy ran eager
 TORCH_COMPILE_SCOPE=loop             # step | loop
 
 # TensorRT KV-split engines baked for THIS checkpoint. Empty = engine-free.
@@ -75,7 +80,11 @@ ARGS=(
 )
 [[ -n "${ACTION_HORIZON}" ]] && ARGS+=(--action-horizon "${ACTION_HORIZON}")
 [[ -n "${DATASET_STATS}" ]] && ARGS+=(--dataset-stats-path "${DATASET_STATS}")
-[[ "${OFFLOAD_TEXT_ENCODER}" == true ]] && ARGS+=(--offload-text-encoder)
+if [[ "${OFFLOAD_TEXT_ENCODER}" == true ]]; then
+  ARGS+=(--offload-text-encoder)
+else
+  ARGS+=(--no-offload-text-encoder)
+fi
 
 for knob in JOINT_VIDEO JOINT_DINO JOINT_POINTMAP PRESENT_VIDEO PRESENT_DINO PRESENT_POINTMAP; do
   varname="INFER_${knob}"
@@ -93,9 +102,9 @@ if [[ -n "${SPLIT_DIR}" ]]; then
   done
   # --glue-cache pairs with the engines and hangs the joint boot alongside
   # --torch-compile, so the compile stack is skipped entirely here.
-  # --no-torch-compile is explicit because serve_yam_flexpi.py defaults
-  # --torch-compile to configs/real_yam.yaml's `torch_compile: true`, and the
-  # two are mutually exclusive — without it the engine path exits at boot.
+  # configs/real_yam.yaml already defaults `torch_compile` to false;
+  # --no-torch-compile states it on the command line, because the server
+  # refuses --glue-cache beside --torch-compile at boot.
   ARGS+=(
     --trt-joint-prefill-split-engine "${PREFILL}"
     --trt-joint-decode-split-engine "${DECODE}"

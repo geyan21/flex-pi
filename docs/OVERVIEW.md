@@ -108,6 +108,12 @@ L = λ_a · L_FM(a_t) + Σ_{i ∈ {o,d,p}} λ_i · L_FM(i_{t+1})
 Per-stream weights are all 1 in every experiment reported in the paper
 (`loss.lambda_*` in the model config).
 
+On a layout whose action head is wider than the embodiment (the 34-D layout of
+[MIXED_EMBODIMENT_34D.md](MIXED_EMBODIMENT_34D.md)), the padded channels are
+held at exactly 0 on the DiT input and target, `L_FM(a_t)` averages over the real
+channels only, and sampling re-zeroes them after every step. Dense layouts carry
+no mask and are unchanged.
+
 One exception to the parameterization: the DINO stream uses **x-prediction** — the
 head predicts the clean features `d_{t+1}` rather than the velocity, since the 2×2
 fold raises each token's feature dim to 3072. The output is converted analytically
@@ -167,3 +173,6 @@ Regime selection from the CLI is documented in the
 | Training entry point | [`scripts/train.py`](../scripts/train.py) |
 | Evaluation | [`experiments/`](../experiments/) |
 | Deployment | [`scripts/serve_yam_flexpi.py`](../scripts/serve_yam_flexpi.py) |
+| 34-D mixed-embodiment layout | [`MIXED_EMBODIMENT_34D.md`](MIXED_EMBODIMENT_34D.md) |
+| Preview checkpoints, zero-shot | [`PRETRAINED.md`](PRETRAINED.md) |
+| Fine-tuning a preview checkpoint | [`FINETUNE.md`](FINETUNE.md) |

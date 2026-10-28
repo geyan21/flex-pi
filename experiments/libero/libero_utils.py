@@ -21,7 +21,7 @@ from flexpi.utils.video_io import save_mp4
 
 DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
-LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+LIBERO_ENV_RESOLUTION = 256  # eval render size; the training corpus is 512x512 (configs/data/libero.yaml raw_shape)
 
 
 def _resolve_bddl_for_language(task_bddl_file):
@@ -94,7 +94,7 @@ def get_libero_env(task, resolution, seed, env_num=1, camera_depths=False,
         "camera_depths": camera_depths,
         # hard_reset=True (robosuite's own default) tears down + rebuilds
         # MjSim + MjRenderContextOffscreen on every env.reset(). That is what
-        # the original FastWAM eval ran, and it is load-bearing for score
+        # the original (pre-release) eval ran, and it is load-bearing for score
         # parity: a soft reset (False) carries mjData internals (solver
         # warm-start) across trials, flipping borderline episodes — the
         # 2026-08-18 old-vs-new A/B only reproduces the reference numbers

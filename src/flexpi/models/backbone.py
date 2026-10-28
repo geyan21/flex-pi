@@ -1406,6 +1406,10 @@ class FlexPiBackbone(torch.nn.Module):
             latents_action = self.infer_action_scheduler.step(
                 pred_action, infer_deltas[i], latents_action,
             )
+            # Padded action channels stay exactly 0 (FlexPi hook; the base
+            # class has no mask, and the eager loops do the same after every step).
+            if hasattr(self, "_zero_padded_action"):
+                latents_action = self._zero_padded_action(latents_action)
         return latents_action
 
     def _predict_action_grad_safe(

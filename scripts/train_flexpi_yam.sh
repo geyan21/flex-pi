@@ -6,8 +6,8 @@
 #
 #   DATASET_DIRS="[./data/yam/<your_set>]" bash scripts/train_flexpi_yam.sh
 #
-# Pre-flights every dataset dir (intrinsics + canonical depth/RGB) and caches
-# the T5 text embeddings before touching a GPU.
+# Pre-flights every dataset dir (canonical RGB, plus intrinsics + depth when the
+# pointmap stream trains) and caches the T5 text embeddings before touching a GPU.
 #
 # Details: docs/YAM.md · knob reference: docs/TRAINING.md
 # =============================================================================
@@ -39,13 +39,23 @@ MAX_STEPS="${MAX_STEPS:-}"
 
 
 # ── Flex randomization ────────────────────────────────────────────────────────
-# Independent Bernoulli per sample; p=1.0 disables that dropout.
-FLEX_P_PRESENT_VIDEO="0.5"
-FLEX_P_PRESENT_DINO="0.5"
-FLEX_P_PRESENT_POINTMAP="0.5"
-FLEX_P_JV="0.5"
-FLEX_P_JD="0.5"
-FLEX_P_JP="0.5"
+# Independent Bernoulli per sample; p=1.0 disables that dropout. A knob that is
+# set is passed as an override and wins over the task preset's flex_joint value;
+# empty (the default) keeps the preset's value: 0.5 for all six in every preset
+# except the RGB-only yam_finetune_pretrain_rgb_preview_*, whose pointmap p are 0.
+FLEX_P_PRESENT_VIDEO="${FLEX_P_PRESENT_VIDEO:-}"
+FLEX_P_PRESENT_DINO="${FLEX_P_PRESENT_DINO:-}"
+FLEX_P_PRESENT_POINTMAP="${FLEX_P_PRESENT_POINTMAP:-}"
+FLEX_P_JV="${FLEX_P_JV:-}"
+FLEX_P_JD="${FLEX_P_JD:-}"
+FLEX_P_JP="${FLEX_P_JP:-}"
+FLEX_ARGS=()
+[[ -n "${FLEX_P_PRESENT_VIDEO}" ]]    && FLEX_ARGS+=("model.flex_joint.p_present_video=${FLEX_P_PRESENT_VIDEO}")
+[[ -n "${FLEX_P_PRESENT_DINO}" ]]     && FLEX_ARGS+=("model.flex_joint.p_present_dino=${FLEX_P_PRESENT_DINO}")
+[[ -n "${FLEX_P_PRESENT_POINTMAP}" ]] && FLEX_ARGS+=("model.flex_joint.p_present_pointmap=${FLEX_P_PRESENT_POINTMAP}")
+[[ -n "${FLEX_P_JV}" ]]               && FLEX_ARGS+=("model.flex_joint.p_jv=${FLEX_P_JV}")
+[[ -n "${FLEX_P_JD}" ]]               && FLEX_ARGS+=("model.flex_joint.p_jd=${FLEX_P_JD}")
+[[ -n "${FLEX_P_JP}" ]]               && FLEX_ARGS+=("model.flex_joint.p_jp=${FLEX_P_JP}")
 
 # ── Run labeling / resume / wandb ─────────────────────────────────────────────
 RUN_NAME="${RUN_NAME:-yam_uflex}"
@@ -60,18 +70,47 @@ WANDB_GROUP="${WANDB_GROUP:-yam_flexpi}"
 # Data prep: preflight, then idempotent T5 text-embed precompute
 # =============================================================================
 
-# Preflight: every dataset dir must carry intrinsics + canonical depth/RGB.
+# The flex probabilities this run trains with: the task preset composed with the
+# FLEX_P_* overrides and the passthrough overrides, as train.py composes it.
+_FLEX_EFFECTIVE="$(python - "task=${TASK_CONFIG}" "${FLEX_ARGS[@]}" "$@" <<'PY'
+import os, sys
+from hydra import compose, initialize_config_dir
+with initialize_config_dir(config_dir=os.path.abspath("configs"), version_base="1.3"):
+    m = compose(config_name="train", overrides=sys.argv[1:]).model
+fj = m.flex_joint
+print(fj.p_present_video, fj.p_present_dino, fj.p_present_pointmap, fj.p_jv, fj.p_jd, fj.p_jp,
+      m.get("enable_pointmap", True))
+PY
+)"
+read -r _PV _PD _PP _JV _JD _JP _ENABLE_PM <<< "${_FLEX_EFFECTIVE}"
+
+# The pointmap stream is off under model.enable_pointmap=false, or when it is
+# never present and never joined (p_present_pointmap = p_jp = 0). Only the
+# pointmap stream reads depth and intrinsics.
+_POINTMAP_OFF=0
+[[ "${_ENABLE_PM}" == "False" ]] && _POINTMAP_OFF=1
+awk -v pp="${_PP}" -v jp="${_JP}" 'BEGIN { exit !(pp + 0 == 0 && jp + 0 == 0) }' \
+  && _POINTMAP_OFF=1
+
+# Preflight: every dataset dir must carry canonical RGB, plus intrinsics and
+# canonical depth when the pointmap stream trains.
 _PREFLIGHT_DIRS="$(printf '%s' "${DATASET_DIRS}" | tr -d '[]' | tr ',' ' ')"
 for _d in ${_PREFLIGHT_DIRS}; do
-  [[ -f "${_d}/meta/camera_intrinsics.json" ]] || {
-    echo "ERROR: ${_d}/meta/camera_intrinsics.json missing — required by the pointmap pipeline." >&2
-    exit 1; }
-  ls "${_d}/videos/chunk-000/observation.depth_ffv1.cam_high/"*.mkv >/dev/null 2>&1 || {
-    echo "ERROR: ${_d} depth not in canonical layout (observation.depth_ffv1.cam_high/*.mkv)." >&2; exit 1; }
+  if [[ "${_POINTMAP_OFF}" != "1" ]]; then
+    [[ -f "${_d}/meta/camera_intrinsics.json" ]] || {
+      echo "ERROR: ${_d}/meta/camera_intrinsics.json missing — required by the pointmap pipeline." >&2
+      exit 1; }
+    ls "${_d}/videos/chunk-000/observation.depth_ffv1.cam_high/"*.mkv >/dev/null 2>&1 || {
+      echo "ERROR: ${_d} depth not in canonical layout (observation.depth_ffv1.cam_high/*.mkv)." >&2; exit 1; }
+  fi
   ls "${_d}/videos/chunk-000/observation.images.cam_high/"*.mp4 >/dev/null 2>&1 || {
     echo "ERROR: ${_d} RGB not in canonical layout (observation.images.cam_high/*.mp4)." >&2; exit 1; }
 done
-echo "Pre-flight OK: depth + intrinsics canonical across $(echo "${_PREFLIGHT_DIRS}" | wc -w) dataset(s)."
+if [[ "${_POINTMAP_OFF}" == "1" ]]; then
+  echo "Pre-flight OK: RGB canonical across $(echo "${_PREFLIGHT_DIRS}" | wc -w) dataset(s) (pointmap off: depth + intrinsics not checked)."
+else
+  echo "Pre-flight OK: depth + intrinsics canonical across $(echo "${_PREFLIGHT_DIRS}" | wc -w) dataset(s)."
+fi
 
 # Into the data config's text_embedding_cache_dir, which training reads back.
 # Already-cached prompts are skipped, so a requeue is cheap.
@@ -91,16 +130,12 @@ EXTRA_ARGS=(
   # The flex model preset comes from the task config's defaults list.
   # ── Flex-joint per-sample randomization ──
   "model.flex_joint.enabled=true"
-  "model.flex_joint.p_present_video=${FLEX_P_PRESENT_VIDEO}"
-  "model.flex_joint.p_present_dino=${FLEX_P_PRESENT_DINO}"
-  "model.flex_joint.p_present_pointmap=${FLEX_P_PRESENT_POINTMAP}"
-  "model.flex_joint.p_jv=${FLEX_P_JV}"
-  "model.flex_joint.p_jd=${FLEX_P_JD}"
-  "model.flex_joint.p_jp=${FLEX_P_JP}"
+  "${FLEX_ARGS[@]}"
 )
 
 [[ -n "${NUM_EPOCHS}" ]]   && EXTRA_ARGS+=("num_epochs=${NUM_EPOCHS}")
-[[ -n "${RESUME}" ]]       && EXTRA_ARGS+=("resume=${RESUME}")
+# A resume never warm-starts, including from a preset's pinned pretrained_ckpt.
+[[ -n "${RESUME}" ]]       && EXTRA_ARGS+=("resume=${RESUME}" "pretrained_ckpt=null")
 [[ -n "${DATASET_WEIGHTS}" ]]   && EXTRA_ARGS+=("++data.train.dataset_weights=${DATASET_WEIGHTS}")
 [[ -n "${SAMPLES_PER_EPOCH}" ]] && EXTRA_ARGS+=("++data.train.samples_per_epoch=${SAMPLES_PER_EPOCH}")
 # ── Warm start (RESUME wins) ──────────────────────────────────────────────────
@@ -114,14 +149,16 @@ if [[ -n "${PRETRAINED_CKPT:-}" ]]; then
       echo "Error: PRETRAINED_CKPT does not exist: ${PRETRAINED_CKPT}" >&2
       exit 1
     fi
-    EXTRA_ARGS+=(
-      "pretrained_ckpt=${PRETRAINED_CKPT}"
-      "pretrained_ckpt_strict_shape=${PRETRAINED_CKPT_STRICT_SHAPE:-false}"
-    )
+    EXTRA_ARGS+=("pretrained_ckpt=${PRETRAINED_CKPT}")
   fi
 fi
+# Unset = the task preset's pretrained_ckpt_strict_shape (true in the
+# yam_finetune_* presets, false from train.yaml otherwise).
+[[ -n "${PRETRAINED_CKPT_STRICT_SHAPE:-}" ]] && EXTRA_ARGS+=("pretrained_ckpt_strict_shape=${PRETRAINED_CKPT_STRICT_SHAPE}")
 # ── YAM-specific overrides ───────────────────────────────────────────────────
-# Norm stats are fit fresh on the first run and cached to the run dir.
+# Norm stats: the task preset's data.train.pretrained_norm_stats when it pins a
+# file (the 34-D and yam_finetune_* presets do); otherwise fit on the first run
+# and cached to the run dir.
 EXTRA_ARGS+=("data.train.dataset_dirs=${DATASET_DIRS}")
 [[ -n "${VAL_SET_PROPORTION}" ]] && EXTRA_ARGS+=("data.train.val_set_proportion=${VAL_SET_PROPORTION}")
 [[ -n "${MAX_STEPS}" ]]          && EXTRA_ARGS+=("max_steps=${MAX_STEPS}")
@@ -151,9 +188,9 @@ _POINTMAP_DISABLED=0
 if [[ "${_POINTMAP_DISABLED}" == "1" ]]; then
   # enable_pointmap=false forces the stream off whatever p_present_pointmap/p_jp
   # say, so tag those NA rather than print a probability that never applied.
-  REGIME_TAG="flex_pv${FLEX_P_PRESENT_VIDEO}_pd${FLEX_P_PRESENT_DINO}_ppNA_jv${FLEX_P_JV}_jd${FLEX_P_JD}_jpNA_2d"
+  REGIME_TAG="flex_pv${_PV}_pd${_PD}_ppNA_jv${_JV}_jd${_JD}_jpNA_2d"
 else
-  REGIME_TAG="flex_pv${FLEX_P_PRESENT_VIDEO}_pd${FLEX_P_PRESENT_DINO}_pp${FLEX_P_PRESENT_POINTMAP}_jv${FLEX_P_JV}_jd${FLEX_P_JD}_jp${FLEX_P_JP}"
+  REGIME_TAG="flex_pv${_PV}_pd${_PD}_pp${_PP}_jv${_JV}_jd${_JD}_jp${_JP}"
 fi
 [[ -n "${PRETRAINED_CKPT:-}" ]] && REGIME_TAG="${REGIME_TAG}_ft"
 
@@ -202,7 +239,7 @@ if [[ -z "${RESUME}" && -d "${OUTPUT_DIR}/checkpoints/state" ]]; then
     _EA=(); for _a in "${EXTRA_ARGS[@]}"; do
       [[ "$_a" == pretrained_ckpt=* || "$_a" == pretrained_ckpt_strict_shape=* ]] || _EA+=("$_a")
     done
-    EXTRA_ARGS=("${_EA[@]}" "resume=${RESUME}")
+    EXTRA_ARGS=("${_EA[@]}" "resume=${RESUME}" "pretrained_ckpt=null")
     echo "[resume] auto-resume from own output dir: ${RESUME} (pretrained warm-init dropped)"
   fi
 fi

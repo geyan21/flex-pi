@@ -20,7 +20,7 @@ gripper conventions — belongs to whatever drives your arm.
 | `deploy_policy.py` | `YamFlexPiPolicy` + `build_policy_from_checkpoint`: model load, observation tensors, denormalization, `Yam32DRelativeAction` inversion. Returns an **absolute** 32D chunk laid out by `yam_eef.STATE_LAYOUT`. |
 | `server_adapter.py` | wraps the policy as a `BasePolicy` for the websocket server |
 | `temporal_smoother.py`, `speed_adapter.py` | optional strategies — a trajectory smoother (OSQP QP over inverse step-durations) and a per-step `speed_factor` map. `server_smoother.py` / `server_speed.py` expose them to the server. |
-| `prediction_recorder.py` | streaming recorder for the predicted observation rollout |
+| `prediction_recorder.py` | the server's prediction recorder (`--record-predictions-*`), driven by `server_adapter.py`; `scripts/render_prediction_dump.py` renders its raw dumps ([`docs/YAM.md`](../../../docs/YAM.md#recording-predictions)) |
 | `client_rtc_step_broker.py` | step-indexed RTC stitching, for a client that overlaps chunks |
 | `_openpi_vendor/` | vendored openpi websocket client/server and msgpack-numpy |
 
@@ -31,7 +31,7 @@ and anything left `null` is derived from the checkpoint's saved config.
 
 ## 2. Offline checks
 
-Neither needs a robot, and `--help` documents every flag.
+None needs a robot, and `--help` documents every flag.
 
 ```bash
 # One inference against a recorded frame, compared to ground truth.
@@ -41,6 +41,12 @@ python -m experiments.yam.flexpi_policy.smoke_test \
 # One RTC stitching cycle on recorded data.
 python -m experiments.yam.flexpi_policy.simulate_rtc_stitching \
     --ckpt <ckpt.pt> --data-dir <dataset>
+
+# Round-trip latency against a running server.
+python scripts/test_rd_client_dummy.py --host localhost --port 8000 --n 15
+
+# A raw prediction dump of a recorded session, rendered to MP4.
+python scripts/render_prediction_dump.py --dump-dir <record-dir>/<session>
 ```
 
 `smoke_test.py --num-passes N` measures steady-state latency; for per-stack
@@ -57,5 +63,8 @@ figures and the TensorRT engines see
   sets, so loading them first is pure I/O — and on an inference-only machine it
   would make deployment depend on the Wan2.2 base shards.
 - **Actions leave absolute.** The relative-action inversion against the current
-  robot state happens inside the policy, so a client receives world-frame
-  targets and must not invert anything again.
+  robot state happens inside the policy, so a client receives absolute targets,
+  each arm's pose in that arm's own base frame as the state was sent, and must
+  not invert anything again.
+- **The prompt is not optional in practice**: with an empty one the policy is
+  unconditioned and success collapses silently.

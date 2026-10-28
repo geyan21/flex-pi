@@ -26,6 +26,7 @@ class LinearNormalizer:
             exception_mode: Dict[str, Dict[str, NormMode]],
             stats: Dict[str, Dict[str, Dict[str, torch.Tensor]]],
             skip_dims_mask: Optional[Dict[str, Dict[str, List[bool]]]] = None,
+            action_clamp: Optional[float] = None,
         ):
         super().__init__()
         self.normalizers = {"action": {}, "state": {}}
@@ -53,6 +54,7 @@ class LinearNormalizer:
                 stats=cur_stats,
                 mode=cur_mode,
                 skip_dims_mask=_get_skip_mask("action", key),
+                clamp=action_clamp,
             )
 
         for meta in shape_meta["state"]:
@@ -106,7 +108,8 @@ class SingleFieldLinearNormalizer:
     range_tol = 1e-4
     output_max = 1.0
     output_min = -1.0
-    def __init__(self, stats, mode: NormMode="min/max", skip_dims_mask: Optional[List[bool]] = None):
+    def __init__(self, stats, mode: NormMode="min/max", skip_dims_mask: Optional[List[bool]] = None,
+                 clamp: Optional[float] = None):
         self.stats = stats
         self.mode = mode
 
@@ -142,6 +145,17 @@ class SingleFieldLinearNormalizer:
             self._clamp_lo, self._clamp_hi = -5.0, 5.0
         else:
             self._clamp_lo, self._clamp_hi = self.output_min, self.output_max
+        # Optional override (processor `action_norm_clamp`, ACTION normalizers only):
+        # symmetric ±clamp for every mode; `.inf` disables clamping, as openpi's quantile
+        # normalization does for action targets (pi0.5 never clips them — values outside
+        # [q01, q99] pass through beyond ±1; its state is bounded to [-1, 1] by the
+        # discrete-state tokenizer, so state keeps the default here). None = the
+        # mode-aware bound above, unchanged.
+        if clamp is not None:
+            clamp = float(clamp)
+            if not clamp > 0:
+                raise ValueError(f"norm clamp must be > 0 (or .inf to disable), got {clamp}")
+            self._clamp_lo, self._clamp_hi = -clamp, clamp
 
         # Per-dim skip: forward(x) = x (clamp still applied but bounded
         # 6D rotation values in [-1, +1] never trigger it).

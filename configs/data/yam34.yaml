@@ -1,0 +1,169 @@
+train:
+  # YAM real-world bimanual in the 34D layout: the same 32D eef32 disk data and
+  # processor chain as yam.yaml, scattered into the AgiBot 34D layout so a YAM
+  # run shares an action head with AgiBot-34D pretrains and co-data. Actions
+  # are supervised relative to the first obs (EEF SE(3) body-frame, joint
+  # scalar delta, gripper absolute) by Yam32DRelativeAction; state stays
+  # absolute. See docs/YAM.md.
+  #
+  # The 34D layout keeps 7 joints per arm ([20:27] L, [27:34] R). YAM has 6, so
+  #     32D[0:20]  EEF        -> 34D[0:20]   (identical)
+  #     32D[20:26] L_joint x6 -> 34D[20:26]  (34D[26], L's 7th joint, is pad)
+  #     32D[26:32] R_joint x6 -> 34D[27:33]  (34D[33], R's 7th joint, is pad)
+  # The pad slots hold exact 0 and are flagged in the sample's
+  # action_dim_is_pad, which the loss masks out.
+  #
+  # Norm stats are the 32-wide rel/h32 YAM pool: the processor normalizes
+  # BEFORE the scatter (transforms -> normalizer -> merger), on the 32-wide
+  # transform output, so the 32D file and the 32-wide norm_skip_dims_mask
+  # apply unchanged.
+  _target_: flexpi.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  depth_codec: ffv1
+  dataset_dirs:
+    - ./data/yam/my_task
+  dataset_weights: null
+  samples_per_epoch: null
+  shape_meta:
+    images:
+      - key: cam_high
+        raw_shape: [3, 360, 640]
+        shape: [3, 256, 320]
+      - key: cam_left_wrist
+        raw_shape: [3, 360, 640]
+        shape: [3, 224, 224]
+      - key: cam_right_wrist
+        raw_shape: [3, 360, 640]
+        shape: [3, 224, 224]
+    depth:
+      - key: cam_high
+        raw_shape: [1, 360, 640]
+        shape: [1, 256, 320]
+      - key: cam_left_wrist
+        raw_shape: [1, 360, 640]
+        shape: [1, 224, 224]
+      - key: cam_right_wrist
+        raw_shape: [1, 360, 640]
+        shape: [1, 224, 224]
+    action:
+      # 32D on disk and after Yam32DRelativeAction; the merger widens to 34.
+      - key: default
+        raw_shape: 32
+        shape: 32
+    state:
+      - key: default
+        raw_shape: 32
+        shape: 32
+  num_frames: 33                            # 1 + 4k (matches LIBERO/AgiBot/RoboTwin)
+  global_sample_stride: 1
+  action_video_freq_ratio: 4                # 32 actions, 9 video frames
+  video_size: [384, 320]                    # head 256×320 + wrists 128×160 composite
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  pretrained_norm_stats: null              # fit from the training data on the first run
+  skip_padding_as_possible: false
+  emit_action_dim_is_pad: true              # the pad slots 26/33 reach the loss as masked
+  concat_multi_camera: "tshape_384x320"           # canonical-name remap + composite slot layout
+  processor:
+    _target_: flexpi.datasets.lerobot.processors.flexpi_processor.FlexPiProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 3
+    action_output_dim: 34
+    proprio_output_dim: 34
+
+    action_state_transforms:
+      - _target_: flexpi.datasets.lerobot.transforms.yam_relative_action.Yam32DRelativeAction
+        anchor: "first"
+
+    use_stepwise_action_norm: False
+    norm_default_mode: q01/q99
+    norm_exception_mode: null
+
+    # 32 -> 34 scatter into the AgiBot layout: 34D[26] and 34D[33] are pad.
+    action_state_merger:
+      _target_: flexpi.datasets.lerobot.transforms.action_state_merger.ScatterToChannels
+      total_dim: 34
+      used_action_channel_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                                20, 21, 22, 23, 24, 25,
+                                27, 28, 29, 30, 31, 32]
+      used_state_channel_ids:  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                                20, 21, 22, 23, 24, 25,
+                                27, 28, 29, 30, 31, 32]
+
+    # 32-wide (pre-scatter). rot6d slots pass through unnormalized — SO(3) is
+    # restored by Gram-Schmidt at decode time, not by bounds.
+    norm_skip_dims_mask:
+      action:
+        default:
+          [false, false, false,                                  # 0-2   L_pos     (rel)
+           true,  true,  true,  true,  true,  true,              # 3-8   L_rot6d   (identity)
+           false, false, false,                                  # 9-11  R_pos     (rel)
+           true,  true,  true,  true,  true,  true,              # 12-17 R_rot6d   (identity)
+           false,                                                # 18    L_grip    (absolute)
+           false,                                                # 19    R_grip    (absolute)
+           false, false, false, false, false, false,             # 20-25 L_joint   (delta)
+           false, false, false, false, false, false]             # 26-31 R_joint   (delta)
+      state:
+        default:
+          [false, false, false,
+           true,  true,  true,  true,  true,  true,
+           false, false, false,
+           true,  true,  true,  true,  true,  true,
+           false,
+           false,
+           false, false, false, false, false, false,
+           false, false, false, false, false, false]
+
+    # Yam32DRelativeAction handles chunk boundaries itself, so the
+    # rotvec/delta-path pad-zeroing is off.
+    delta_action_dim_mask: null
+
+    train_transforms:
+      cam_high:
+        - _target_: flexpi.datasets.lerobot.transforms.image.ToTensor
+        - _target_: torchvision.transforms.Resize
+          size: [256, 320]
+      cam_left_wrist:
+        - _target_: flexpi.datasets.lerobot.transforms.image.ToTensor
+        - _target_: torchvision.transforms.Resize
+          size: [224, 224]
+      cam_right_wrist:
+        - _target_: flexpi.datasets.lerobot.transforms.image.ToTensor
+        - _target_: torchvision.transforms.Resize
+          size: [224, 224]
+    val_transforms:
+      cam_high:
+        - _target_: flexpi.datasets.lerobot.transforms.image.ToTensor
+        - _target_: torchvision.transforms.Resize
+          size: [256, 320]
+      cam_left_wrist:
+        - _target_: flexpi.datasets.lerobot.transforms.image.ToTensor
+        - _target_: torchvision.transforms.Resize
+          size: [224, 224]
+      cam_right_wrist:
+        - _target_: flexpi.datasets.lerobot.transforms.image.ToTensor
+        - _target_: torchvision.transforms.Resize
+          size: [224, 224]
+  text_embedding_cache_dir: ./data/text_embeds_cache/yam
+  context_len: 128
+
+val:
+  _target_: ${data.train._target_}
+  depth_codec: ${data.train.depth_codec}
+  dataset_dirs: ${data.train.dataset_dirs}
+  shape_meta: ${data.train.shape_meta}
+  num_frames: ${data.train.num_frames}
+  global_sample_stride: ${data.train.global_sample_stride}
+  action_video_freq_ratio: ${data.train.action_video_freq_ratio}
+  video_size: ${data.train.video_size}
+  camera_key: ${data.train.camera_key}
+  val_set_proportion: ${data.train.val_set_proportion}
+  is_training_set: false
+  pretrained_norm_stats: null               # runtime fills from work_dir/dataset_stats.json
+  skip_padding_as_possible: ${data.train.skip_padding_as_possible}
+  emit_action_dim_is_pad: ${data.train.emit_action_dim_is_pad}
+  concat_multi_camera: ${data.train.concat_multi_camera}
+  processor: ${data.train.processor}        # Hydra instantiates a fresh processor; .eval() set by trainer
+  text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+  context_len: ${data.train.context_len}

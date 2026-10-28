@@ -42,6 +42,7 @@ from flexpi.datasets.lerobot.utils.normalizer import load_dataset_stats_from_jso
 from flexpi.utils.pytorch_utils import set_global_seed
 from flexpi.utils.libero_setup import assert_mujoco_pin, prepare_libero
 from flexpi.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from flexpi.models.helpers.action_pad import resolve_action_dim_mask
 
 logger = logging.getLogger(__name__)
 
@@ -658,6 +659,43 @@ def _resolve_model_slot_key_map(cfg: DictConfig) -> Optional[dict]:
     return {str(k): str(v) for k, v in skm.items()}
 
 
+def _build_K(entry: dict, target_hw: tuple) -> torch.Tensor:
+    """K from a camera_intrinsics.json entry, rescaled onto ``target_hw``.
+
+    Endpoint convention ``(target - 1) / (raw - 1)``, the one
+    ``RobotVideoDataset._k_stack_from_raw`` applies at training time, paired
+    with the linspace-endpoint nearest depth regrid in ``_depth_to_grid`` so K
+    and depth land on one grid. A raw extent of 1 or less keeps the scale at 1.
+    """
+    h_t, w_t = target_hw
+    raw_w, raw_h = float(entry["width"]), float(entry["height"])
+    sx = (float(w_t) - 1.0) / (raw_w - 1.0) if raw_w > 1 else 1.0
+    sy = (float(h_t) - 1.0) / (raw_h - 1.0) if raw_h > 1 else 1.0
+    return torch.tensor(
+        [[entry["fx"] * sx, 0.0, entry["cx"] * sx],
+         [0.0, entry["fy"] * sy, entry["cy"] * sy],
+         [0.0, 0.0, 1.0]], dtype=torch.float32,
+    )
+
+
+def _depth_to_grid(arr: np.ndarray, target_hw: tuple) -> torch.Tensor:
+    """Depth ``[H, W]`` int32 mm on ``target_hw``, sampled the way training does.
+
+    The linspace-endpoint nearest sampler of ``RobotVideoDataset``: rounded
+    ``linspace(0, src - 1, target)`` rows and columns, gathered. That is the
+    grid the endpoint K rescale in ``_build_K`` describes. int32 rather than
+    uint16 because the gather has no uint16 CPU kernel; the dataset path returns
+    int32 (FFV1 decoder) too, and PointmapEncoder casts to float internally.
+    """
+    t = torch.from_numpy(arr.astype(np.int32))
+    h_t, w_t = int(target_hw[0]), int(target_hw[1])
+    if tuple(t.shape) != (h_t, w_t):
+        ys = torch.linspace(0, t.shape[0] - 1, h_t).round().long()
+        xs = torch.linspace(0, t.shape[1] - 1, w_t).round().long()
+        t = t[ys[:, None], xs[None, :]]
+    return t
+
+
 def _load_eval_camera_intrinsics(cfg: DictConfig) -> torch.Tensor:
     """Load the per-cam intrinsics tensor for 3D eval.
 
@@ -704,16 +742,6 @@ def _load_eval_camera_intrinsics(cfg: DictConfig) -> torch.Tensor:
             "derived from a single shared FOV are wrong by 1.85x on the wrist."
         )
 
-    def _build_K(entry: dict, target_hw: tuple) -> torch.Tensor:
-        h_t, w_t = target_hw
-        sx = float(w_t) / float(entry["width"])
-        sy = float(h_t) / float(entry["height"])
-        return torch.tensor(
-            [[entry["fx"] * sx, 0.0, entry["cx"] * sx],
-             [0.0, entry["fy"] * sy, entry["cy"] * sy],
-             [0.0, 0.0, 1.0]], dtype=torch.float32,
-        )
-
     K_high = _build_K(_resolve_entry(_HEAD_KEY_ALIASES),       head_hw)
     K_left = _build_K(_resolve_entry(_LEFT_WRIST_KEY_ALIASES), wrist_hw)
     K_right = K_left.clone()  # synthetic — depth is zero, K value doesn't matter
@@ -755,16 +783,7 @@ def _extract_per_cam_depth_for_model(
     raw = get_libero_per_cam_depth_uint16_mm(obs, env)   # {image, wrist_image} np.uint16
 
     def _to_tensor(arr: np.ndarray, target_hw_tuple: tuple) -> torch.Tensor:
-        # Dataset path returns int32 (FFV1 decoder); match that. PointmapEncoder
-        # casts to float internally so int32 vs uint16 makes no difference.
-        t = torch.from_numpy(arr.astype(np.int32))
-        if t.shape != tuple(target_hw_tuple):
-            # Nearest interpolation to preserve discrete depth values.
-            t = transforms_F.resize(
-                t.unsqueeze(0).float(), list(target_hw_tuple),
-                interpolation=transforms_F.InterpolationMode.NEAREST,
-            )[0].to(torch.int32)
-        return t.to(device).reshape(1, 1, *target_hw_tuple)
+        return _depth_to_grid(arr, target_hw_tuple).to(device).reshape(1, 1, *target_hw_tuple)
 
     head_hw = target_hw.get("image", (256, 320))
     wrist_hw = target_hw.get("wrist_image", (224, 224))
@@ -1030,7 +1049,7 @@ def _predict_action_chunk(
 
 
 def _get_max_steps(task_suite_name: str) -> int:
-    # Follows FastWAM's LIBERO eval setup
+    # Follows Fast-WAM's LIBERO eval setup
     suite_steps = {
         "libero_spatial": 400,
         "libero_object": 400,
@@ -1505,6 +1524,20 @@ def eval_single_process(cfg: DictConfig):
     processor: FlexPiProcessor = instantiate(cfg.data.train.processor).eval()
     processor.set_normalizer_from_stats(dataset_stats)
     logging.info("Using dataset stats: %s", dataset_stats_path)
+
+    # Padded action-head channels (libero.yaml scatters 7 -> 32) stay at exactly
+    # 0 through denoising iff training zeroed them too: a checkpoint deploys the
+    # way it trained. The released LIBERO checkpoints predate the mask and run
+    # unarmed; one trained on this tree carries the payload flag. Armed before
+    # the first infer_action so a compiled graph captures the mask it serves with.
+    # EVALUATION.action_dim_mask: null decides from the checkpoint, true/false forces.
+    action_dim_mask = cfg.EVALUATION.get("action_dim_mask", None)
+    pad, reason = resolve_action_dim_mask(processor, model, cfg, action_dim_mask)
+    model.set_action_dim_mask(pad)
+    if pad is not None:
+        logging.info("action_dim_mask: channels %s zero-filled", torch.nonzero(pad).flatten().tolist())
+    else:
+        logging.info("action_dim_mask: not armed (%s)", reason)
 
     # FlexPi3D: load camera intrinsics once and cache on the model. Depth
     # comes from the LIBERO sim per step (camera_depths=True). The model's

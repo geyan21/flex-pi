@@ -70,13 +70,15 @@ _LAYOUT = {
 # ---------------------------------------------------------------------------
 
 
-def build_obs_dummy(intrinsics_json: Optional[Path]) -> Dict[str, Any]:
+def build_obs_dummy() -> Dict[str, Any]:
     """All-zero observation at native YAM resolution (360×640 head + wrists).
 
-    The policy resizes RGB to per-cam targets internally; depth stays at this
-    native grid since the pointmap encoder is grid-agnostic. Intrinsics are
-    required by the unified-joint model; pulled from the JSON if provided or
-    left for the policy to source from its constructor cache.
+    The policy resizes RGB *and* depth to the trained per-cam grid internally,
+    so the obs stays on the camera-native grid. K comes from the policy's
+    ``--intrinsics-json`` cache at that same trained grid: the pointmap encoder
+    unprojects at the depth's resolution with the K it is handed and never
+    rescales it, so the pair must land on one grid, and the policy's depth
+    regrid is what keeps them paired.
     """
     H_native, W_native = 360, 640  # matches yam_test_2ep_360x640
     rgb = {cam: np.zeros((H_native, W_native, 3), dtype=np.uint8) for cam in _CAM_ORDER}
@@ -89,16 +91,12 @@ def build_obs_dummy(intrinsics_json: Optional[Path]) -> Dict[str, Any]:
     state[_LAYOUT["left_rot6d"]]  = np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
     state[_LAYOUT["right_rot6d"]] = np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
 
-    obs: Dict[str, Any] = {
+    return {
         "rgb": rgb,
         "depth": depth,
         "state_32": state,
         "intrinsics": None,
     }
-    if intrinsics_json is not None:
-        from experiments.yam.flexpi_policy.deploy_policy import _load_intrinsics_for_yam
-        obs["intrinsics"] = _load_intrinsics_for_yam(intrinsics_json).numpy()
-    return obs
 
 
 def build_obs_npz(npz_path: Path) -> Dict[str, Any]:
@@ -227,11 +225,11 @@ def build_obs_recorded(
         depth[cam] = d_int32[0].clip(0, 65535).astype(np.uint16)
 
     # ---- Intrinsics ----
-    from experiments.yam.flexpi_policy.deploy_policy import _load_intrinsics_for_yam
-    K_json = data_dir / "meta" / "camera_intrinsics.json"
-    intrinsics = _load_intrinsics_for_yam(K_json).numpy()
-
-    obs = {"rgb": rgb, "depth": depth, "state_32": state_32, "intrinsics": intrinsics}
+    # K stays with the policy: build_policy_from_checkpoint loads the dataset's
+    # meta/camera_intrinsics.json at the checkpoint's depth grid, and the policy
+    # resamples the storage-grid depth above onto that same grid
+    # (linspace-endpoint nearest, like training) so the pair stays paired.
+    obs = {"rgb": rgb, "depth": depth, "state_32": state_32, "intrinsics": None}
     return obs, instruction
 
 
@@ -347,7 +345,7 @@ def _print_assumptions(args: argparse.Namespace) -> None:
     print(f"  - Training transform = Yam32DRelativeAction(anchor='first'); deploy inverts it using observation['state_32'] as anchor.")
     print(f"  - Camera order: {_CAM_ORDER} (canonical RoboTwin-rename layout).")
     print(f"  - Depth is uint16 millimetres on a per-cam grid (head 256×320 / wrists 224×224 target).")
-    print(f"  - input_image composite is [1, 3, 384, 320] built from per-cam RGB.")
+    print(f"  - input_image composite is built from per-cam RGB on the checkpoint's composite layout (384×320 for the YAM checkpoints).")
     print(f"  - Prompt template: DEFAULT_PROMPT.format(task=...). Text encoder runs live (no cache lookup).")
     print(f"  - obs-source = {args.obs_source!r}")
 
@@ -366,8 +364,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stats", default=None, help="Path to dataset_stats.json. If omitted, walked from --ckpt.")
     p.add_argument(
         "--intrinsics-json", default=None,
-        help="Path to meta/camera_intrinsics.json. Required for dummy/npz "
-             "obs sources unless the obs supplies its own intrinsics array.",
+        help="Path to meta/camera_intrinsics.json, loaded by the policy at the "
+             "checkpoint's depth grid. Required for the dummy obs source; "
+             "recorded defaults to the dataset's own; npz carries its own array.",
     )
     p.add_argument(
         "--obs-source", choices=["recorded", "npz", "dummy"], default="recorded",
@@ -451,8 +450,7 @@ def main() -> int:
         if not instruction:
             instruction = "manipulate the objects on the table"
     else:  # dummy
-        intrinsics_json = Path(args.intrinsics_json) if args.intrinsics_json else None
-        obs = build_obs_dummy(intrinsics_json)
+        obs = build_obs_dummy()
         if not instruction:
             instruction = "manipulate the objects on the table"
 
@@ -460,12 +458,14 @@ def main() -> int:
 
     # ---- Build policy + load checkpoint ----
     print("\n[smoke] === Loading policy ===")
-    intrinsics_json = (
-        Path(args.intrinsics_json) if args.intrinsics_json
-        # When obs supplies its own intrinsics array, the constructor cache
-        # is optional. None is fine for recorded/npz modes.
-        else None
-    )
+    if args.intrinsics_json:
+        intrinsics_json = Path(args.intrinsics_json)
+    elif args.obs_source == "recorded":
+        # The dataset's own K; the policy loads it at the checkpoint's depth grid.
+        intrinsics_json = Path(args.data_dir) / "meta" / "camera_intrinsics.json"
+    else:
+        # npz obs carry their own intrinsics array; the constructor cache is optional.
+        intrinsics_json = None
     policy: YamFlexPiPolicy = build_policy_from_checkpoint(
         checkpoint_path=str(ckpt),
         dataset_stats_path=args.stats,

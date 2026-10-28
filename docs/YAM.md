@@ -96,6 +96,9 @@ Warm-start from a checkpoint you have (optional):
 PRETRAINED_CKPT=/path/to/step_040000.pt bash scripts/train_flexpi_yam.sh
 ```
 
+Warm-starting from the preview checkpoints takes a 34-D preset and the
+checkpoint's own stats file; [`FINETUNE.md`](FINETUNE.md) has both.
+
 Full-state `RESUME` wins over the warm start
 ([`TRAINING.md §4`](TRAINING.md#4-finetune-vs-resume)); relaunching with
 neither auto-resumes from the run's own output directory.
@@ -110,8 +113,11 @@ runs/yam_unified_flex_3cam_32d_rel_1e-4/<run_id>_<regime_tag>_yam_uflex/
 └── checkpoints/state/step_NNNNNN/    # DeepSpeed full state, for RESUME
 ```
 
-Norm statistics are fit fresh on the first run and cached into the run directory
-— there is no committed-stats reuse for YAM.
+For this preset, norm statistics are fit fresh on the first run and cached into
+the run directory. Its sibling `task=yam_unified_flex_3cam_34d_rel_1e-4` trains
+the same data in the 34-D action layout
+([`MIXED_EMBODIMENT_34D.md`](MIXED_EMBODIMENT_34D.md)), with statistics fit the
+same way.
 
 ---
 
@@ -120,6 +126,7 @@ Norm statistics are fit fresh on the first run and cached into the run directory
 Two processes: a **policy server** that holds the GPU and serves action chunks
 over a websocket, and a **client** that owns the robot. The server is here; the
 client is yours to write, against the [wire contract](#wire-contract) below.
+Serving the preview checkpoints zero-shot is [`PRETRAINED.md`](PRETRAINED.md).
 
 ### What you need
 
@@ -132,10 +139,10 @@ config.yaml           # trained config — the server builds the model from this
 dataset_stats.json    # normalizer statistics
 ```
 
-`--ckpt-path` points at the `.pt`; the other two are found beside it, so keep
-the run directory intact. Wan2.2 and DINOv3 come from
-[`INSTALL.md §2`](INSTALL.md#2-weights); TensorRT only if you want the fastest
-path.
+`--ckpt-path` points at the `.pt`; the other two are found up to five directories
+above it, so keep the run directory intact (the preview downloads have the same
+shape). Wan2.2 and DINOv3 come from [`INSTALL.md §2`](INSTALL.md#2-weights);
+TensorRT only if you want the fastest path.
 
 The environment is [`INSTALL.md`](INSTALL.md) plus its `[serve]` extra:
 
@@ -163,14 +170,17 @@ Pass the bare instruction. The server wraps it in the same template training use
 wrapping it yourself double-wraps it.
 
 The operating point comes from `configs/real_yam.yaml` (4 denoise steps, bf16,
-T5 on CPU, compile on). The `--infer-*` flags are passed explicitly, because
-unset means "whatever this checkpoint was trained with".
+T5 on CPU, compile **off**; templates B and C pass `--torch-compile` themselves,
+and the launcher passes it with `TORCH_COMPILE=true`). The `--infer-*` flags are
+passed explicitly, because unset means "whatever this checkpoint was trained
+with".
 
 ### A · Full joint, KV-split TensorRT engines — fastest
 
 Requires the KV-split pair baked for **this exact checkpoint** —
 [`INFERENCE_OPTIMIZATION.md §2`](INFERENCE_OPTIMIZATION.md#2-building-the-engines).
-`--no-torch-compile` is not optional; the server refuses `--glue-cache` beside it.
+`--no-torch-compile` is required: the server refuses `--glue-cache` beside
+`--torch-compile`.
 
 ```bash
 export SPLIT_DIR=/path/to/engines/split_024500
@@ -192,7 +202,7 @@ python scripts/serve_yam_flexpi.py \
 python scripts/serve_yam_flexpi.py \
     --ckpt-path "$CKPT" --default-prompt "$PROMPT" \
     --host 0.0.0.0 --port 8000 \
-    --compile-encoders \
+    --torch-compile --compile-encoders \
     --infer-joint-video true --infer-joint-dino true --infer-joint-pointmap true \
     --infer-present-video true --infer-present-dino true --infer-present-pointmap true
 ```
@@ -205,7 +215,7 @@ To ablate, flip any of the six flags and check the regime line in the boot log.
 python scripts/serve_yam_flexpi.py \
     --ckpt-path "$CKPT" --default-prompt "$PROMPT" \
     --host 0.0.0.0 --port 8000 \
-    --compile-encoders \
+    --torch-compile --compile-encoders \
     --infer-joint-video false --infer-joint-dino false --infer-joint-pointmap false
 ```
 
@@ -225,6 +235,45 @@ websocket.
 | B | full joint, engine-free | 360 | 15.8 GB |
 | C | action only | **60** | 15.8 GB |
 
+### D · 34-D checkpoints
+
+A checkpoint trained in the 34-D action layout (`yam34`, or the preview
+checkpoints) serves through the same server; the wire stays 32-D in both
+directions. It runs eager (`--no-torch-compile`). The commands for the preview
+checkpoints, one per regime, are [`PRETRAINED.md §4`](PRETRAINED.md#4-server-commands).
+A correct boot logs `action_dim_mask: channels [26, 33] zero-filled` and
+`PREWARM DONE`, after which `/healthz` answers `OK`. The regime is set on the
+server and the client follows it:
+
+| regime | server | client |
+|---|---|---|
+| depth in | `--infer-present-pointmap true` | sends `observation/depth_<cam>` and `observation/intrinsics_<cam>` for all three cameras |
+| no depth | `--infer-present-pointmap false` | sends neither |
+| full joint | all three `--infer-joint-*` `true` | sends no `joint_*` keys |
+
+On one A100-80GB, this server returns action chunks bit-identical to the
+pre-release deploy code for `flexpi-pretrain-rgb-preview` with its released
+`config.yaml` (same weights, prompt, flags, seed). `--torch-compile`
+and the TensorRT engines were not part of that comparison.
+
+### Recording predictions
+
+`--record-predictions-dir <dir>` records the model's predicted future for every
+chunk, one session per websocket connection under `<dir>/<timestamp>_<remote>/`.
+Recording forces the joint-denoise regime on every call.
+
+| flag | default | effect |
+|---|---|---|
+| `--record-predictions-mode` | `raw` | `raw` dumps tensors off the action path, rendered later by `scripts/render_prediction_dump.py --dump-dir <session>`; `live` renders `prediction.mp4` per chunk |
+| `--record-predictions-fps` | 7.5 | output frame rate (predicted frames are 4 actions apart at 30 Hz) |
+| `--record-predictions-frames-per-chunk` | 0 (all) | frames kept per chunk |
+| `--record-predictions-keep-anchor` | off | keep each chunk's frame 0 (the present observation) |
+| `--record-predictions-split` | `none` | `row` / `tile`: one extra MP4 per row or per cell |
+
+`scripts/test_rd_client_dummy.py --host localhost --port 8000` measures the
+round-trip latency against a running server with no robot, and is the smallest
+client of the wire contract below.
+
 ### Wire contract
 
 msgpack over websocket. A request is one flat dict; `_synthesize_prewarm_obs()`
@@ -234,8 +283,19 @@ exactly the wire shapes — `observation/image_<cam>` `uint8 [H,W,3]`,
 `observation/intrinsics_<cam>` `float32 [fx,fy,cx,cy]`, `observation/state`
 `float32 [32]` laid out by
 [`yam_eef.STATE_LAYOUT`](../src/flexpi/datasets/lerobot/utils/yam_eef.py), and an
-optional `prompt`. The response is `{"actions": float32 [action_horizon, 32]}` —
-absolute, already de-normalized against the state you sent.
+optional `prompt`. Depth and intrinsics come for all three cameras or for none.
+The response carries `actions`, `float32 [action_horizon, 32]` — absolute,
+already de-normalized against the state you sent — beside `raw_actions` (before
+the optional smoother), `speed_factors` and `policy_timing`. The contract is the
+same for a 34-D checkpoint. The metadata's `depth_required` says whether the
+server's regime needs depth. Each arm's pose is in that arm's own base frame with
+the TCP at `grasp_site`; the gripper is a measured opening in [0, 1], 1 = open
+([`PRETRAINED.md §6`](PRETRAINED.md#6-input-contract)).
+
+`observation/state` is also the anchor the relative action is inverted against;
+sending the pose of the last commanded joints (`0:18`, `20:32`) with measured
+grippers (`18:20`) keeps gravity droop from compounding across chunks
+([`PRETRAINED.md §7`](PRETRAINED.md#7-what-a-client-does)).
 
 ```python
 from experiments.yam.flexpi_policy._openpi_vendor.websocket_client_policy import WebsocketClientPolicy
@@ -259,7 +319,12 @@ training-side ones — OOM included — in
 | --- | --- |
 | Plausible but wrong actions on the engine path | the engine was baked for another checkpoint. `unset SPLIT_DIR CKPT PROMPT` when switching task or checkpoint — the server compares `build_meta.json`, but an engine baked before that sidecar only warns |
 | Wrong actions right after connecting | the server may be a forgotten one running another task's model. Check the boot log's checkpoint path, `num_inference_steps` and `FlexPi inference regime:` line |
-| Boot hangs on a joint model | `--glue-cache` with `--torch-compile`; the server rejects the pair |
+| Boot hangs on a joint model | `--glue-cache` with `--torch-compile`; the server rejects the pair ([`INFERENCE_OPTIMIZATION.md §3`](INFERENCE_OPTIMIZATION.md#3-what-runs-where)) |
+| Boot hangs in the inductor compile on a 34-D checkpoint | serve eager (`--no-torch-compile`, the `real_yam.yaml` default) |
+| `observation['depth'] is missing` on every request | the pointmap stream is present and the client sends no depth (§D's regime table) |
+| `Could not locate config.yaml next to the checkpoint` / `Could not auto-locate dataset_stats.json` | no `config.yaml` / `dataset_stats.json` within five directories above the weights; `--dataset-stats-path` names the stats file directly |
+| `model._target_ is '…', not a flexpi target` at boot | the `config.yaml` above the weights was saved by the pre-release codebase; the released checkpoints ship one written for this tree |
+| `action_dim_mask: not armed (...)` on a 34-D checkpoint | the wrong `config.yaml` was found above the weights, the checkpoint trained without the mask, or `EVALUATION.action_dim_mask=false` in `configs/real_yam.yaml` |
 | `camera_intrinsics.json missing` at launch | the dataset has no `meta/camera_intrinsics.json` — rebuild it (step 1), or write the file by hand |
 | `depth not in canonical layout` | RGB/depth keys are not `cam_high` / `cam_left_wrist` / `cam_right_wrist`, or the build used `--depth-codec none` |
 | `empty prompt list` / `metadata prompt path must yield list[str]` during a build | the capture's `language.prompt` is missing, empty, or not a list of strings; fix it upstream — that string is also what you send at deploy time |
@@ -267,8 +332,8 @@ training-side ones — OOM included — in
 | `Cannot detect model type for wan_video_vae ... File: []` | `DIFFSYNTH_MODEL_BASE_PATH` is wrong or empty — the Wan2.2 weights were not found |
 | NaN actions | a zero rotation block in `observation/state` — the 6D blocks (`3:9`, `12:18`) are the first two rows of R, so identity is `[1, 0, 0, 0, 1, 0]`, not zeros |
 | Shape mismatch against the engine | engine built at a different `--ctx-len`; rebuild at the trained `tokenizer_max_len + 1` |
-| A non-default composite layout is served at the wrong geometry | known gap — the deploy path reads a fixed camera-layout table |
 | Robot stalls between chunks | joint denoise is ~3x action-only at 4 steps; use template A, or C if that is still too slow |
-| Periodic arm sag at chunk boundaries | relative actions anchored on the measured pose instead of the last commanded one, so gravity droop compounds every chunk. Check `FLEXPI_EEF_BASE` is not `measured`; grippers (`18:20`) stay measured either way |
+| Periodic arm sag at chunk boundaries | relative actions anchored on the measured pose instead of the last commanded one, so gravity droop compounds every chunk ([wire contract](#wire-contract)); grippers (`18:20`) stay measured either way |
 | First robot frame stalls for seconds | the regime was overridden per-request, so the boot warmup compiled the wrong one. The server owns the regime — do not send `joint_*` / `present_*` from the client |
-| `ModuleNotFoundError: experiments.yam.flexpi_policy` | this repo's root is not on `PYTHONPATH`, or it points at a different checkout |
+| First request after boot takes seconds | `--offload-text-encoder`: the first new prompt runs T5 on the CPU; later requests hit the cache |
+| `ModuleNotFoundError: experiments.yam.flexpi_policy` | this repo's root is not on `PYTHONPATH`, or another checkout earlier on `sys.path` supplies `experiments.yam` |

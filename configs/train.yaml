@@ -18,17 +18,22 @@ max_steps: null
 log_every: 10
 save_every: 100
 eval_every: 50
+train_video_log_every: 500  # GT clip of the current train batch to eval_dir + wandb data/train_video (no inference); 0 disables
 eval_num_inference_steps: 10
 keep_last_n_states: 3
 keep_last_n_weights: 3
 
 eval_video: true
+eval_action_samples: 1      # val draws per eval, each a different val window and rollout noise seed, metrics averaged; noise falls as sqrt(k), cost is k x the eval
 share_pca_basis: true
 
 gradient_accumulation_steps: 1
 mixed_precision: "bf16"
 seed: 42
-max_grad_norm: 1.0
+# null (or 0.0) = no clipping, which is what every DeepSpeed launch has always
+# done: the value never reached DeepSpeed. The DDP / single-GPU accelerate configs
+# did clip at the old default 1.0. Set a positive float to clip on every backend.
+max_grad_norm: null
 weight_decay: 0.0
 resume: null
 resume_reanchor_lr_schedule: false
@@ -36,6 +41,25 @@ resume_config_source: "current"
 
 pretrained_ckpt: null
 pretrained_ckpt_strict_shape: false
+
+# LoRA fine-tuning. Off: every MoT parameter trains (full fine-tune). On: the
+# MoT (both experts, 6.02 B) is frozen and rank-`rank` adapters train on the
+# Linears `target_modules` names (regex, full match, per expert), plus the MoT
+# parameters `full_train` names at full rank; everything outside the MoT trains
+# as in a full fine-tune. Needs pretrained_ckpt (or resume). Weights files are
+# saved merged (stock payload); checkpoints/lora/step_N.pt holds the adapters.
+# Top level, not under model:, because deploy instantiates cfg.model as saved.
+lora:
+  enabled: false
+  rank: 16
+  alpha: 16
+  dropout: 0.0
+  target_modules:
+    video: 'blocks\.\d+\.((self_attn|cross_attn)\.[qkvo]|ffn\.[02])'
+    action: 'blocks\.\d+\.((self_attn|cross_attn)\.[qkvo]|ffn\.[02])'
+  full_train:
+    video: '(patch_embedding|head)\..+'
+    action: '(action_encoder|head)\..+'
 
 wandb:
   enabled: false            # launchers pass WANDB_ENABLED through to here

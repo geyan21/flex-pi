@@ -122,17 +122,22 @@ class BaseProcessor(ABC):
         return instruction
 
     def action_state_transform(self, batch):
+        # `raw_shape` may be a LIST of admissible on-disk widths for
+        # mixed-embodiment corpora (kept in sync with
+        # flexpi_processor.action_state_transform).
         if "action" in batch:
             for meta in self.shape_meta["action"]:
                 k, meta_shape = meta["key"], meta["raw_shape"]
                 actual_shape = batch["action"][k].shape[-1]
-                assert actual_shape == meta_shape, \
+                allowed = (meta_shape,) if isinstance(meta_shape, int) else tuple(int(x) for x in meta_shape)
+                assert actual_shape in allowed, \
                     f"Action key {k} actual raw shape {actual_shape} mismatch with meta raw shape {meta_shape}."
-                    
+
         for meta in self.shape_meta["state"]:
             k, meta_shape = meta["key"], meta["raw_shape"]
             actual_shape = batch["state"][k].shape[-1]
-            assert actual_shape == meta_shape, \
+            allowed = (meta_shape,) if isinstance(meta_shape, int) else tuple(int(x) for x in meta_shape)
+            assert actual_shape in allowed, \
                 f"State key {k} actual raw shape {actual_shape} mismatch with meta raw shape{meta_shape}."
         
         if self.action_state_transforms is not None: 

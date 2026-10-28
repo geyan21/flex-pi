@@ -62,13 +62,15 @@ from flexpi.datasets.lerobot.processors.flexpi_processor import FlexPiProcessor 
 from flexpi.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT  # noqa: E402
 from flexpi.datasets.lerobot.robot_video_dataset import _PER_CAM_HW  # noqa: E402
 from flexpi.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json  # noqa: E402
-from flexpi.per_cam_compose import compose_robotwin_from_per_cam  # noqa: E402
+from flexpi.models.helpers.action_pad import resolve_action_dim_mask  # noqa: E402
+from flexpi.per_cam_compose import compose_from_per_cam  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 
 # Canonical YAM camera order. Matches the dataset YAML's shape_meta.images
-# entries and the RGB ``_PER_CAM_HW`` table imported above.
+# entries; ``_PER_CAM_HW`` (same order) is the depth-grid fallback for a
+# config with no depth block.
 _CAM_ORDER: Tuple[str, str, str] = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
 # Runtime knob defaults live in configs/real_yam.yaml so the deploy, the smoke
@@ -115,8 +117,12 @@ def _find_trained_config(ckpt_path: Path) -> Optional[Path]:
     Training writes ``<run_dir>/config.yaml`` and the checkpoint usually lives
     at ``<run_dir>/checkpoints/.../step_XXXX.pt`` (or directly under
     ``<run_dir>/state/step_XXXXXX/``). The shallow walk covers both layouts.
+
+    ``absolute()`` rather than ``resolve()``: in a checkpoint directory whose
+    weights file is a symlink beside its sidecars, resolving would walk the
+    link target's directory instead.
     """
-    for parent in list(ckpt_path.resolve().parents)[:5]:
+    for parent in list(ckpt_path.absolute().parents)[:5]:
         candidate = parent / "config.yaml"
         if candidate.is_file():
             return candidate
@@ -134,41 +140,67 @@ def _find_dataset_stats(ckpt_path: Path, override: Optional[Path]) -> Path:
     if override is not None:
         path = Path(override).expanduser().resolve()
         if not path.exists():
-            raise FileNotFoundError(f"--stats path does not exist: {path}")
+            raise FileNotFoundError(f"dataset_stats.json path does not exist: {path}")
         return path
-    for parent in list(ckpt_path.resolve().parents)[:5]:
+    for parent in list(ckpt_path.absolute().parents)[:5]:
         candidate = parent / "dataset_stats.json"
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(
         "Could not auto-locate dataset_stats.json from the checkpoint path. "
-        "Pass --stats <path/to/dataset_stats.json> explicitly."
+        "The path can be passed explicitly: --dataset-stats-path "
+        "(serve_yam_flexpi.py, render_prediction_dump.py), or --stats "
+        "(smoke_test.py)."
     )
 
 
-def _load_intrinsics_for_yam(json_path: Path) -> torch.Tensor:
-    """Load per-camera intrinsics rescaled to the depth grid the model trained on.
+def _per_cam_depth_hw(shape_meta) -> List[Tuple[str, Tuple[int, int]]]:
+    """The trained depth grid, ``[(cam, (H, W)), ...]`` from ``shape_meta.depth``.
 
-    YAM training (``yam.yaml`` shape_meta.depth) uses head 256×320,
-    wrists 224×224 — the same per-cam HW table as ``_PER_CAM_HW``. The pointmap
-    encoder rescales internally if depth and K disagree, but training and deploy
-    agree on this grid, so the rescale here is a numerical no-op for that case.
+    Depth and K must share this grid; ``RobotVideoDataset`` derives its own
+    ``_per_cam_hw`` the same way. A config with no depth block never consumes
+    either, and the legacy table stands in so the shapes stay defined.
+    """
+    depth_meta = shape_meta.get("depth")
+    if depth_meta is None:
+        return list(_PER_CAM_HW)
+    return [
+        (str(m["key"]), (int(m["shape"][-2]), int(m["shape"][-1]))) for m in depth_meta
+    ]
 
-    Returns: ``[3, 3, 3]`` float32 tensor in ``_CAM_ORDER``.
+
+def _load_intrinsics_for_yam(
+    json_path: Path, target_hw: List[Tuple[str, Tuple[int, int]]],
+) -> torch.Tensor:
+    """Load per-camera intrinsics rescaled to ``target_hw``, the trained depth grid.
+
+    K and depth must land on the same grid: ``PointmapEncoder`` unprojects at
+    whatever resolution the depth arrives in, with the K it is handed as-is
+    (``encode_composite``: "K is never rescaled here"). ``_build_per_cam_depth``
+    resamples depth onto this same grid, so the pair stays aligned.
+
+    The rescale uses the endpoint convention ``(target - 1) / (raw - 1)`` --
+    the one ``RobotVideoDataset._k_stack_from_raw`` applies at training time,
+    paired with the linspace-endpoint nearest depth resample. The corner
+    convention ``target / raw`` drifts from training by ~0.2% of fx on a
+    640->320 rescale.
+
+    Returns: ``[N, 3, 3]`` float32 tensor in ``target_hw`` order.
     """
     if not json_path.exists():
         raise FileNotFoundError(f"camera_intrinsics.json not found: {json_path}")
     with open(json_path, "r") as f:
         raw = json.load(f)
     Ks = []
-    for cam_name, (h_cam, w_cam) in _PER_CAM_HW:
+    for cam_name, (h_cam, w_cam) in target_hw:
         if cam_name not in raw:
             raise KeyError(
                 f"{json_path} missing camera '{cam_name}' (found: {list(raw)})"
             )
         entry = raw[cam_name]
-        sx = float(w_cam) / float(entry["width"])
-        sy = float(h_cam) / float(entry["height"])
+        raw_w, raw_h = float(entry["width"]), float(entry["height"])
+        sx = (float(w_cam) - 1.0) / (raw_w - 1.0) if raw_w > 1 else 1.0
+        sy = (float(h_cam) - 1.0) / (raw_h - 1.0) if raw_h > 1 else 1.0
         K = torch.tensor(
             [
                 [float(entry["fx"]) * sx, 0.0,                       float(entry["cx"]) * sx],
@@ -179,6 +211,26 @@ def _load_intrinsics_for_yam(json_path: Path) -> torch.Tensor:
         )
         Ks.append(K)
     return torch.stack(Ks, dim=0)
+
+
+def _restack_k_to_slots(
+    K: torch.Tensor, row_cams, layout, slot_key_map: Dict[str, str],
+) -> torch.Tensor:
+    """``K`` rows named by ``row_cams`` -> rows in ``layout.cam_slots()`` order.
+
+    ``PointmapEncoder`` indexes ``camera_intrinsics`` by slot, and the training
+    loader stacks K the same way (``RobotVideoDataset._restack_k_to_slots``,
+    disk order -> slot order). Identity for every shipped layout, where slot
+    order and ``row_cams`` coincide; the tensor is then returned as-is.
+    """
+    slot_order = [slot_key_map[s.key] for s in layout.cam_slots()]
+    if slot_order == list(row_cams):
+        return K
+    by_cam = dict(zip(row_cams, K))
+    missing = [c for c in slot_order if c not in by_cam]
+    if missing:
+        raise KeyError(f"camera intrinsics missing cams {missing}; got {list(row_cams)}")
+    return torch.stack([by_cam[c] for c in slot_order], dim=0)
 
 
 def _resize_rgb_antialiased(rgb_uint8: np.ndarray, hw: Tuple[int, int]) -> torch.Tensor:
@@ -207,11 +259,12 @@ class YamFlexPiPolicy:
     shape):
 
       - ``rgb`` : ``{cam_name: np.uint8 [H_native, W_native, 3]}``  (RGB order)
-      - ``depth``: ``{cam_name: np.uint16 [H, W]}`` in millimetres, optional.
+      - ``depth``: ``{cam_name: np.uint16 [H, W]}`` in millimetres, optional;
+        resampled onto the trained depth grid when it arrives on another grid.
       - ``state_32``: ``np.float32 [32]`` per ``yam_eef.STATE_LAYOUT``.
-      - ``intrinsics``: ``np.float32 [3, 3, 3]`` per-cam K at the depth grid
-        in ``_CAM_ORDER``, optional. When None the policy uses the K cached at
-        construction time (from ``meta/camera_intrinsics.json``).
+      - ``intrinsics``: ``np.float32 [3, 3, 3]`` per-cam K at the trained depth
+        grid in ``_CAM_ORDER``, optional. When None the policy uses the K cached
+        at construction time (from ``meta/camera_intrinsics.json``).
 
     ``infer_action_chunk`` returns a ``np.float32 [T_act, 32]`` numpy array of
     **absolute** 32D actions (Yam32DRelativeAction inverted using ``state_32``
@@ -222,6 +275,7 @@ class YamFlexPiPolicy:
         self,
         model_cfg: DictConfig,
         processor_cfg: DictConfig,
+        trained_cfg: DictConfig,
         checkpoint_path: str,
         dataset_stats_path: Path,
         device: str,
@@ -254,6 +308,9 @@ class YamFlexPiPolicy:
         # will actually serve so the compile cost is paid at startup, not on
         # the first robot frame. None = trained-config default.
         warmup_flex: Optional[Dict[str, bool]] = None,
+        # EVALUATION.action_dim_mask: None decides from the checkpoint,
+        # True/False forces (see resolve_action_dim_mask).
+        action_dim_mask: Optional[bool] = None,
     ) -> None:
         # Text encoder load: usually live (default). offload_text_encoder=True
         # keeps T5 on CPU end-to-end (saves ~10 GB VRAM) — mirrors RoboTwin
@@ -302,6 +359,37 @@ class YamFlexPiPolicy:
         dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
         self.processor.set_normalizer_from_stats(dataset_stats)
 
+        # Per-cam grids this checkpoint trained on. RGB follows the composite
+        # layout's slots; depth (and K, which must sit on the depth's grid)
+        # follows shape_meta.depth, the way RobotVideoDataset derives its own.
+        kmap = self.model._slot_key_map
+        self._rgb_hw: List[Tuple[str, Tuple[int, int]]] = [
+            (kmap[s.key], tuple(s.src_hw)) for s in self.model._layout.cam_slots()
+        ]
+        self._depth_hw: List[Tuple[str, Tuple[int, int]]] = _per_cam_depth_hw(
+            self.processor.shape_meta
+        )
+        logger.info(
+            "YamFlexPiPolicy layout=%s composite_hw=%s rgb_hw=%s depth_hw=%s",
+            self.model._layout.name, tuple(self.model._layout.composite_hw),
+            self._rgb_hw, self._depth_hw,
+        )
+
+        # Padded action-head channels stay at exactly 0 through denoising iff
+        # training zeroed them too. Armed before any warmup so a compiled graph
+        # captures the mask it will serve with.
+        self._action_dim_pad, reason = resolve_action_dim_mask(
+            self.processor, self.model, trained_cfg, action_dim_mask
+        )
+        self.model.set_action_dim_mask(self._action_dim_pad)
+        if self._action_dim_pad is not None:
+            logger.info(
+                "action_dim_mask: channels %s zero-filled",
+                torch.nonzero(self._action_dim_pad).flatten().tolist(),
+            )
+        else:
+            logger.info("action_dim_mask: not armed (%s)", reason)
+
         self.action_horizon = int(action_horizon)
         self.num_inference_steps = int(num_inference_steps)
         self.num_video_frames = int(num_video_frames)
@@ -313,10 +401,16 @@ class YamFlexPiPolicy:
         self.tiled = bool(tiled)
         self.dynamic_step_skip = bool(dynamic_step_skip)
 
+        # The json K arrives in shape_meta.depth order; the encoder indexes
+        # rows by layout slot.
         if intrinsics_K is not None:
-            self._cached_K = intrinsics_K.to(device=self.model.device)
+            self._cached_K = _restack_k_to_slots(
+                intrinsics_K, [cam for cam, _ in self._depth_hw],
+                self.model._layout, self.model._slot_key_map,
+            ).to(device=self.model.device)
         else:
             self._cached_K = None
+        self._depth_regrid_warned: set = set()
 
         # Cache the resolved infer_action signature once. The unified-joint
         # model's ``infer_action`` takes ``per_cam``, ``per_cam_depth``,
@@ -355,10 +449,11 @@ class YamFlexPiPolicy:
         """Run one dummy ``infer_action`` to trigger torch.compile + CUDA-Graph capture.
 
         Shapes match what ``infer_action_chunk`` will feed at real inference:
-        composite ``input_image`` ``[1, 3, 384, 320]``, per-cam RGB at the YAM
-        ``_PER_CAM_HW`` sizes, per-cam depth on the same grids in ``uint16``,
-        and a 32D proprio. Identity intrinsics avoid hitting the pointmap
-        encoder's K-rescale path during warmup.
+        composite ``input_image`` at the layout's ``composite_hw``, per-cam RGB
+        at the layout's slot sizes, per-cam depth on the trained depth grid in
+        ``uint16``, and a 32D proprio. Identity intrinsics are a placeholder:
+        the pointmap encoder never rescales K, so any ``[N, 3, 3]`` serves a
+        shape-only pass.
         """
         warmup_t0 = time.perf_counter()
         device = self.model.device
@@ -371,7 +466,8 @@ class YamFlexPiPolicy:
 
         proprio_dim = getattr(self.model, "proprio_dim", 32)
         dummy_proprio = torch.zeros((1, int(proprio_dim)), dtype=torch.float32)
-        dummy_image = torch.zeros((1, 3, 384, 320), device=device, dtype=dtype)
+        comp_h, comp_w = self.model._layout.composite_hw
+        dummy_image = torch.zeros((1, 3, comp_h, comp_w), device=device, dtype=dtype)
 
         warmup_kwargs: Dict[str, Any] = {
             "prompt": None,
@@ -398,18 +494,18 @@ class YamFlexPiPolicy:
         if "per_cam" in self._infer_sig:
             warmup_kwargs["per_cam"] = {
                 cam_name: torch.zeros((1, 3, h, w), device=device, dtype=dtype)
-                for cam_name, (h, w) in _PER_CAM_HW
+                for cam_name, (h, w) in self._rgb_hw
             }
         if "per_cam_depth" in self._infer_sig:
             warmup_kwargs["per_cam_depth"] = {
                 cam_name: torch.zeros((1, 1, h, w), device=device, dtype=torch.uint16)
-                for cam_name, (h, w) in _PER_CAM_HW
+                for cam_name, (h, w) in self._depth_hw
             }
             if hasattr(self.model, "set_camera_intrinsics"):
                 K_id = (
                     torch.eye(3, device=device)
                     .unsqueeze(0)
-                    .expand(len(_PER_CAM_HW), -1, -1)
+                    .expand(len(self._depth_hw), -1, -1)
                     .contiguous()
                 )
                 self.model.set_camera_intrinsics(K_id)
@@ -435,13 +531,13 @@ class YamFlexPiPolicy:
     # ------------------------------------------------------------------
 
     def _build_per_cam_rgb(self, rgb_by_cam: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
-        """Per-camera RGB at per-cam target sizes (head 256×320, wrists 224×224).
+        """Per-camera RGB at the layout's slot sizes (``self._rgb_hw``).
 
         Matches RobotVideoDataset → exactly one antialiased bilinear
         resize from native, then linear normalize to ``[-1, 1]``.
         """
         out: Dict[str, torch.Tensor] = {}
-        for cam_name, (h_cam, w_cam) in _PER_CAM_HW:
+        for cam_name, (h_cam, w_cam) in self._rgb_hw:
             if cam_name not in rgb_by_cam:
                 raise KeyError(
                     f"observation['rgb'] is missing camera '{cam_name}'; "
@@ -460,14 +556,37 @@ class YamFlexPiPolicy:
             out[cam_name] = t  # [1, 3, h, w]
         return out
 
-    def _build_per_cam_depth(self, depth_by_cam: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
-        """Depth tensors at sim-native resolution. Pass-through uint16 mm.
+    def _needs_depth(self, present_pointmap: Optional[bool]) -> bool:
+        """Whether this call will actually consume ``per_cam_depth``.
 
-        Same contract RoboTwin deploy uses: ``[1, 1, H, W]`` uint16 on the
-        model's device; the encoder does the ``.float()/1000`` cast itself.
+        Depth feeds only the present-pointmap stream; the model itself raises
+        exactly when ``per_cam_depth is None and self._infer_present_p``
+        (``FlexPi.infer_action``). ``present_pointmap=None`` means "no
+        override": the model's standing default applies, which ``infer_action``
+        restores in its ``finally`` so it is always the pre-call value here.
+        """
+        if present_pointmap is not None:
+            return bool(present_pointmap)
+        return bool(getattr(self.model, "_infer_present_p", True))
+
+    def _build_per_cam_depth(self, depth_by_cam: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+        """Depth tensors on the trained depth grid (``self._depth_hw``).
+
+        ``[1, 1, H, W]`` uint16 mm on the model's device; the encoder does the
+        ``.float()/1000`` cast itself.
+
+        Depth must land on the same grid as K: the pointmap encoder unprojects
+        at the depth's own resolution with the K it is handed and never
+        rescales K to match, so off-grid depth silently produces XYZ scaled by
+        the resize ratio. Callers that already deliver the trained grid (a client
+        that resizes depth to the metadata's ``per_cam_hw`` and rescales K in
+        lock-step) hit the no-op path; camera-native depth (smoke test, dataset replay) is resampled here
+        with the linspace-endpoint nearest sampler training uses
+        (``RobotVideoDataset``): integer mm preserved, grid aligned with the
+        endpoint K rescale in ``_load_intrinsics_for_yam``.
         """
         out: Dict[str, torch.Tensor] = {}
-        for cam_name in _CAM_ORDER:
+        for cam_name, (h_cam, w_cam) in self._depth_hw:
             if cam_name not in depth_by_cam:
                 raise KeyError(
                     f"observation['depth'] is missing camera '{cam_name}'; "
@@ -484,18 +603,38 @@ class YamFlexPiPolicy:
             depth = torch.from_numpy(depth_np).contiguous()
             if depth.dtype != torch.uint16:
                 depth = depth.to(torch.int32).clamp_(0, 65535).to(torch.uint16)
+            src_h, src_w = int(depth.shape[0]), int(depth.shape[1])
+            if (src_h, src_w) != (h_cam, w_cam):
+                if cam_name not in self._depth_regrid_warned:
+                    self._depth_regrid_warned.add(cam_name)
+                    logger.warning(
+                        "observation['depth'][%s] arrived at %dx%d but the model "
+                        "trains on %dx%d -- resampling (linspace-endpoint nearest). "
+                        "Supply depth on the trained grid (and K rescaled to match) "
+                        "to skip this, as a client that resamples to the connect "
+                        "metadata's per_cam_hw does.",
+                        cam_name, src_h, src_w, h_cam, w_cam,
+                    )
+                ys = torch.linspace(0, src_h - 1, h_cam).round().long()
+                xs = torch.linspace(0, src_w - 1, w_cam).round().long()
+                # No uint16 index kernel on CPU: gather through int32 (lossless).
+                depth = depth.to(torch.int32)[ys[:, None], xs[None, :]].to(torch.uint16)
+                depth = depth.contiguous()
             out[cam_name] = depth.unsqueeze(0).unsqueeze(0).to(device=self.model.device)
         return out
 
     def _compose_input_image(self, per_cam: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Derive the [1, 3, 384, 320] composite from the per-cam tensors.
+        """Derive the ``[1, 3, *composite_hw]`` composite from the per-cam tensors.
 
-        Same helper RobotVideoDataset uses internally — single
+        Composes on the model's own layout and slot map, the way the model's
+        ``build_inputs`` composes the per-cam training samples — single
         compose pipeline shared by train and deploy.
         """
         per_cam_5d = {k: v.unsqueeze(2) for k, v in per_cam.items()}  # [B, 3, T=1, H, W]
-        composite = compose_robotwin_from_per_cam(per_cam_5d)  # [1, 3, 1, 384, 320]
-        return composite.squeeze(2)  # [1, 3, 384, 320]
+        composite = compose_from_per_cam(
+            per_cam_5d, self.model._layout, slot_key_map=self.model._slot_key_map,
+        )  # [1, 3, 1, *composite_hw]
+        return composite.squeeze(2)  # [1, 3, *composite_hw]
 
     # ------------------------------------------------------------------
     # State + action plumbing
@@ -504,11 +643,11 @@ class YamFlexPiPolicy:
     def _normalize_state(self, state_32: np.ndarray) -> torch.Tensor:
         """Apply the same forward pipeline the dataloader applies to state.
 
-        Note Yam32DRelativeAction leaves state untouched (only action is
-        transformed there), so the relevant step is only the normalizer.
-        We still route through ``action_state_transform`` to mirror the
-        RoboTwin deploy exactly — it would be a no-op for state, but the
-        shape-assertions inside catch wrong-dim bugs early.
+        Same order as ``FlexPiProcessor.preprocess``: transforms, normalizer,
+        merger. Yam32DRelativeAction leaves state untouched (only action is
+        transformed there); AlignTo34DByWidth widens a 32-D state to the 34-D
+        head when the checkpoint carries one, and the merger scatters into the
+        head layout (identity for plain 32-D checkpoints).
         """
         if state_32.shape != (32,):
             raise ValueError(f"state_32 must have shape (32,); got {state_32.shape}")
@@ -520,26 +659,30 @@ class YamFlexPiPolicy:
         batch = {"state": {state_key: torch.as_tensor(state_32, dtype=torch.float32).unsqueeze(0)}}
         batch = self.processor.action_state_transform(batch)
         batch = self.processor.normalizer.forward(batch)
-        # [1, 32]; the action_dit expects [B, proprio_dim]. Mirrors RoboTwin path.
-        return batch["state"][state_key]
+        batch = self.processor.action_state_merger.forward(batch)
+        # [1, proprio_dim]; the action_dit expects [B, proprio_dim].
+        return batch["state"]
 
     def _denormalize_action(
         self,
         action_normalized: torch.Tensor,
         anchor_state_32: np.ndarray,
     ) -> np.ndarray:
-        """Invert normalize + Yam32DRelativeAction.
+        """Invert merger + normalize + the action_state_transforms chain.
 
         Steps:
-          1. ``normalizer.backward`` on the per-key action  → relative action
-             in (mostly) original units. For YAM this is the 32D layout with
-             EEF blocks in body-frame relative form and the joint block in
-             scalar-delta form.
+          1. ``merger.backward`` gathers the head's channels into the
+             normalizer's layout (identity for plain 32-D checkpoints), then
+             ``normalizer.backward`` on the per-key action → relative action
+             in (mostly) original units: EEF blocks in body-frame relative
+             form and the joint block in scalar-delta form.
           2. Apply each ``action_state_transforms`` in *reverse* order with
              ``backward=True``. Yam32DRelativeAction reads ``state[..., 0, :]``
              as the anchor — we feed ``anchor_state_32`` (T_obs=1) as that
              anchor, mirroring yam_openpi's server-side
-             ``RelativeEEFActions.backward`` which uses ``data["state"]``.
+             ``RelativeEEFActions.backward`` which uses ``data["state"]``. The
+             anchor is first run through the forward chain so it has the width
+             the backward chain expects (AlignTo34DByWidth widens 32 → 34).
 
         Returns: ``np.float32 [T_act, 32]`` absolute action chunk.
         """
@@ -553,26 +696,32 @@ class YamFlexPiPolicy:
             raise ValueError("Expected exactly one action key in shape_meta.")
         action_key = action_meta[0]["key"]
 
-        # Step 1: per-key denormalize. action_state_merger is identity scatter
-        # (ScatterToChannels(total_dim=32)) for YAM, so we don't need to call
-        # action_state_merger.backward — the model already emits 32D in the
-        # final scatter layout.
+        # Step 1: merger.backward gathers the head's channels into the
+        # normalizer's layout (identity for plain 32-D ckpts; 34 -> 32 for a
+        # scattered 34-D head), then per-key denormalize.
+        merged = self.processor.action_state_merger.backward(
+            {"action": action_normalized.to(dtype=torch.float32, device="cpu")}
+        )
         normalizer = self.processor.normalizer.normalizers["action"][action_key]
-        denorm = normalizer.backward(action_normalized.to(dtype=torch.float32, device="cpu"))
+        denorm = normalizer.backward(merged["action"][action_key])
 
-        # Step 2: invert action_state_transforms in reverse order. For YAM the
-        # only transform is Yam32DRelativeAction; in the general case we walk
-        # the list to stay generic. Anchor state is the CURRENT obs (T_obs=1).
+        # Step 2: invert action_state_transforms in reverse order. Anchor state
+        # is the CURRENT obs (T_obs=1).
         transforms = self.processor.action_state_transforms or []
         if len(transforms) > 0:
             state_meta = self.processor.shape_meta["state"]
             state_key = state_meta[0]["key"]
-            anchor = torch.as_tensor(anchor_state_32, dtype=torch.float32)  # [32]
-            # [B=1, T_obs=1, 32] — Yam32DRelativeAction reads state[..., 0, :].
-            anchor_state = anchor.unsqueeze(0).unsqueeze(0)
+            # Run the anchor through the forward chain so it has the width the
+            # backward chain expects (AlignTo34DByWidth widens 32 -> 34; the
+            # relative transform leaves state untouched).
+            anchor = self.processor.action_state_transform({
+                "state": {state_key: torch.as_tensor(anchor_state_32, dtype=torch.float32).unsqueeze(0)},
+            })["state"][state_key]  # [1, D]
+            # [B=1, T_obs=1, D] — Yam32DRelativeAction reads state[..., 0, :].
+            anchor_state = anchor.unsqueeze(0)
             batch = {
-                "action": {action_key: denorm},                # [B=1, T_act, 32]
-                "state":  {state_key:  anchor_state},          # [B=1, T_obs=1, 32]
+                "action": {action_key: denorm},                # [B=1, T_act, D]
+                "state":  {state_key:  anchor_state},          # [B=1, T_obs=1, D]
             }
             for trans in reversed(transforms):
                 batch = trans.backward(batch)
@@ -610,9 +759,9 @@ class YamFlexPiPolicy:
         """Run a single forward pass and return ``[T_act, 32]`` absolute actions.
 
         ``observation`` keys are documented on the class docstring. Missing
-        ``depth`` is supported only if the model's ``infer_action`` signature
-        does NOT declare ``per_cam_depth`` — for the YAM 0509 model it does,
-        so depth is required.
+        ``depth`` is supported if the model's ``infer_action`` signature does
+        NOT declare ``per_cam_depth``, or if the pointmap stream is off for
+        this call (``present_pointmap=False``) — depth feeds only that stream.
 
         When ``return_latents=True`` the return shape changes from
         ``np.ndarray`` to a dict with keys ``action_abs`` (the usual ndarray)
@@ -624,27 +773,35 @@ class YamFlexPiPolicy:
         per_cam_rgb = self._build_per_cam_rgb(observation["rgb"])
         input_image = self._compose_input_image(per_cam_rgb)
 
-        # ---- Depth & intrinsics (required for the YAM unified-joint model) ----
+        # ---- Depth & intrinsics (needed only while the pointmap stream is on) ----
         per_cam_depth: Optional[Dict[str, torch.Tensor]] = None
         K_tensor: Optional[torch.Tensor] = None
         if "per_cam_depth" in self._infer_sig:
-            if "depth" not in observation or observation["depth"] is None:
-                raise ValueError(
-                    "Model signature declares `per_cam_depth` but observation['depth'] is missing. "
-                    "The YAM unified-joint 0509 model requires per-camera depth at deploy."
-                )
-            per_cam_depth = self._build_per_cam_depth(observation["depth"])
+            if self._needs_depth(present_pointmap):
+                if "depth" not in observation or observation["depth"] is None:
+                    raise ValueError(
+                        "Model signature declares `per_cam_depth` and the pointmap "
+                        "stream is present, but observation['depth'] is missing. "
+                        "Supply depth, or run with present_pointmap=False "
+                        "(server: --infer-present-pointmap false)."
+                    )
+                per_cam_depth = self._build_per_cam_depth(observation["depth"])
             K = observation.get("intrinsics")
             if K is not None:
-                K_tensor = torch.as_tensor(K, dtype=torch.float32, device=self.model.device)
+                # Rows arrive in _CAM_ORDER; the encoder indexes them by layout slot.
+                K_tensor = _restack_k_to_slots(
+                    torch.as_tensor(K, dtype=torch.float32, device=self.model.device),
+                    _CAM_ORDER, self.model._layout, self.model._slot_key_map,
+                )
             elif self._cached_K is not None:
                 K_tensor = self._cached_K
-            else:
+            elif per_cam_depth is not None:
                 raise ValueError(
                     "per_cam_depth provided but no camera intrinsics available — "
                     "supply observation['intrinsics'] [3,3,3] or pass --intrinsics-json at construction."
                 )
-            self.model.set_camera_intrinsics(K_tensor)
+            if K_tensor is not None:
+                self.model.set_camera_intrinsics(K_tensor)
 
         # ---- Proprio ----
         state_32 = np.asarray(observation["state_32"], dtype=np.float32)
@@ -781,6 +938,7 @@ def build_policy_from_checkpoint(
     torch_compile_mode: str = _D["torch_compile_mode"],
     quantization: Optional[str] = _D["quantization"],
     dynamic_step_skip: bool = _D["dynamic_step_skip"],
+    action_dim_mask: Optional[bool] = _D["action_dim_mask"],
     # Acceleration / engine knobs. Not in real_yam.yaml: serve_yam_flexpi.py
     # passes every one of them explicitly, and the two engine paths are
     # machine-specific -- a published config is the wrong place for them.
@@ -805,7 +963,7 @@ def build_policy_from_checkpoint(
     (``Yam32DRelativeAction(anchor="first")``) without needing to compose
     a sim yaml.
     """
-    ckpt = Path(checkpoint_path).expanduser().resolve()
+    ckpt = Path(checkpoint_path).expanduser().absolute()
     if not ckpt.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
 
@@ -818,6 +976,20 @@ def build_policy_from_checkpoint(
         )
     print(f"[YAM-deploy] Loaded trained config: {trained_cfg_path}")
     trained_cfg = OmegaConf.load(trained_cfg_path)
+    # A run trained on the pre-release codebase saved that package's targets.
+    # Hydra cannot locate them here, and where the old package is importable it
+    # builds the old model under this deploy glue without an error; the
+    # config.yaml shipped with each released checkpoint carries flexpi targets.
+    for key in ("model", "data.train.processor"):
+        target = OmegaConf.select(trained_cfg, f"{key}._target_")
+        if target is not None and not str(target).startswith("flexpi."):
+            raise SystemExit(
+                f"[YAM-deploy] {trained_cfg_path}: {key}._target_ is {target!r}, "
+                "not a flexpi target: this is the saved config of a run trained on "
+                "the pre-release codebase. Each released checkpoint ships a "
+                "config.yaml with flexpi targets next to its weights "
+                "(docs/PRETRAINED.md)."
+            )
 
     # Neutralize the training-time DiT bootstrap loads. The trained checkpoint
     # is the source of truth for *all* DiT parameters (video + action) — the
@@ -857,7 +1029,10 @@ def build_policy_from_checkpoint(
     # carry K itself, but if neither is provided we'll raise later.
     K = None
     if intrinsics_json is not None:
-        K = _load_intrinsics_for_yam(Path(intrinsics_json).expanduser())
+        K = _load_intrinsics_for_yam(
+            Path(intrinsics_json).expanduser(),
+            _per_cam_depth_hw(trained_cfg.data.train.shape_meta),
+        )
         print(
             f"[YAM-deploy] intrinsics_json: {intrinsics_json}  K_high.fx={K[0,0,0].item():.2f} "
             f"K_high.fy={K[0,1,1].item():.2f}"
@@ -877,6 +1052,7 @@ def build_policy_from_checkpoint(
     return YamFlexPiPolicy(
         model_cfg=trained_cfg.model,
         processor_cfg=trained_cfg.data.train.processor,
+        trained_cfg=trained_cfg,
         checkpoint_path=str(ckpt),
         dataset_stats_path=stats_path,
         device=device,
@@ -905,4 +1081,5 @@ def build_policy_from_checkpoint(
         compile_encoders=compile_encoders,
         dynamic_step_skip=dynamic_step_skip,
         warmup_flex=warmup_flex,
+        action_dim_mask=action_dim_mask,
     )

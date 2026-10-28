@@ -1,7 +1,7 @@
 # LIBERO — training and evaluation
 
 End-to-end recipe for the LIBERO benchmark: four suites of 10 tasks each, scored
-over 50 trials per task under per-suite step budgets following FastWAM's setup.
+over 50 trials per task under per-suite step budgets following Fast-WAM's setup.
 
 Everything here runs from the **repository root**. One-time environment and
 weight setup is [`docs/INSTALL.md`](INSTALL.md); the per-knob reference behind the
@@ -70,6 +70,10 @@ bash scripts/train_flexpi_libero.sh model.enable_pointmap=false data=libero_node
 Evaluation needs no counterpart flag; it rebuilds the model from the run's saved
 `config.yaml`.
 
+`libero.yaml` does not set `emit_action_dim_is_pad`, so training averages the
+action loss over all 32 channels of the 7 → 32 scatter, as for the released
+checkpoints ([`MIXED_EMBODIMENT_34D.md §2`](MIXED_EMBODIMENT_34D.md#2-the-per-sample-pad-mask)).
+
 ### Outputs
 
 ```
@@ -101,6 +105,10 @@ Both launchers take two paths and find the run's `config.yaml` beside them:
 Architecture is auto-loaded from that saved `config.yaml` — geometry, DINO grid
 and action dim come from *training*, so both take the same command and
 `model.*` / `data.*` overrides on the eval CLI are **ignored**.
+
+Evaluation rescales K by `(w − 1)/(W − 1)` and regrids depth with the
+linspace-endpoint nearest sampler, as training does. The published success rates
+predate this (K by `w/W`, torchvision nearest) and have not been re-measured.
 
 ### Installing LIBERO
 

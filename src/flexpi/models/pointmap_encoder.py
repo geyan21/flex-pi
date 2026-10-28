@@ -5,9 +5,19 @@ and slot recompose.
 Defaults to RoboTwin for back-compat.
 
 The encoder consumes depth from the dataset (``sample['per_cam_depth']``),
-unprojects with the sample's per-camera K, min-max normalizes XYZ into
-``[-1, 1]``, and pastes the resulting "XYZ-as-RGB" tensors into the composite
-layout. The composite then goes through the same WAN VAE that encodes the RGB
+unprojects with the sample's per-camera K, maps XYZ into ``[-1, 1]`` against
+FIXED bounds, and pastes the resulting "XYZ-as-RGB" tensors into the composite
+layout.
+
+Fixed bounds, not min-max: ``_normalize_pointmap`` CLAMPS to
+``pointmap_norm_bounds`` (default x, y = ±0.5 m, z = [0, 1.5]) and then rescales
+that interval to ``[-1, 1]``. Anything outside saturates. This docstring used to
+say "min-max normalizes", which reads as though the range were derived from the
+data and nothing were lost -- and what is lost is not small: measured over 177
+ABC-130k episodes, the shipped ±0.5 clips **74.29 %** of valid ``cam_high``
+pixels in the 1920x1200 population. Whether to widen the bounds is an open
+question; this paragraph exists so the behaviour is not hidden by the word
+"min-max". The composite then goes through the same WAN VAE that encodes the RGB
 composite, so the pointmap latents land 1:1 with the video latents.
 
 Depth *source* is external to this module — it can come from the RoboTwin
@@ -153,10 +163,25 @@ class PointmapEncoder(nn.Module):
                 depth_m = depth_m_full[:, frame_indices]
             F_dim = depth_m.shape[1]
             depth_m = depth_m.reshape(B * F_dim, 1, H, W)
-            K_cam = camera_intrinsics[cam_idx].to(
-                device=depth_m.device, dtype=torch.float32,
-            )
-            K_batch = K_cam.unsqueeze(0).expand(B * F_dim, 3, 3)
+            if camera_intrinsics.ndim == 4:
+                # [B, num_cams, 3, 3]: one K per batch item, as produced by
+                # per-episode intrinsics. `depth_m` was flattened B-major /
+                # F-minor, so each item's K repeats F_dim times to line up.
+                if camera_intrinsics.shape[0] != B:
+                    raise ValueError(
+                        f"camera_intrinsics batch {camera_intrinsics.shape[0]} != "
+                        f"depth batch {B} for cam '{name}'"
+                    )
+                K_cam = camera_intrinsics[:, cam_idx].to(
+                    device=depth_m.device, dtype=torch.float32,
+                )
+                K_batch = K_cam.repeat_interleave(F_dim, dim=0)
+            else:
+                # [num_cams, 3, 3]: one K shared by the whole batch.
+                K_cam = camera_intrinsics[cam_idx].to(
+                    device=depth_m.device, dtype=torch.float32,
+                )
+                K_batch = K_cam.unsqueeze(0).expand(B * F_dim, 3, 3)
             xyz = self._unproject(depth_m, K_batch)
             xyz = self._normalize_pointmap(xyz)
             results.append(xyz)
@@ -204,15 +229,19 @@ class PointmapEncoder(nn.Module):
         kmap = layout.resolve_slot_key_map(slot_key_map)
         cam_slots = layout.cam_slots()
 
-        if camera_intrinsics.ndim == 4:
-            camera_intrinsics = camera_intrinsics[0]
+        # [num_cams, 3, 3] (one K for the batch) and [B, num_cams, 3, 3] (one K
+        # per batch item, from per-episode intrinsics) are both accepted; the
+        # cam axis is the one before the 3x3. Batching used to be collapsed to
+        # item 0 here, which silently unprojected an entire batch with the first
+        # sample's calibration whenever the batch mixed rigs.
         if (
-            camera_intrinsics.shape[-2:] != (3, 3)
-            or camera_intrinsics.shape[0] != len(cam_slots)
+            camera_intrinsics.ndim not in (3, 4)
+            or camera_intrinsics.shape[-2:] != (3, 3)
+            or camera_intrinsics.shape[-3] != len(cam_slots)
         ):
             raise ValueError(
-                f"Expected camera_intrinsics of shape [{len(cam_slots)}, 3, 3], "
-                f"got {tuple(camera_intrinsics.shape)}"
+                f"Expected camera_intrinsics of shape [{len(cam_slots)}, 3, 3] or "
+                f"[B, {len(cam_slots)}, 3, 3], got {tuple(camera_intrinsics.shape)}"
             )
 
         cam_names = [kmap[s.key] for s in cam_slots]
@@ -249,6 +278,16 @@ class PointmapEncoder(nn.Module):
             H_dst, W_dst = slot_hw_map[slot.key]
             BF, C, H_src, W_src = xyz.shape
             if (H_src, W_src) != (H_dst, W_dst):
+                # `nearest`, deliberately, for checkpoint parity. Every shipped
+                # checkpoint (RoboTwin, LIBERO, YAM, the pre-release 34-D runs)
+                # trained with PyTorch's legacy `nearest`, so deploy must resample
+                # the same way or the wrist XYZ tiles move under the model.
+                # Measured against the bilinear grid the RGB tile lands on,
+                # `nearest` sits 0.600 px (x) / 0.750 px (y) off on the 224->160
+                # and 224->128 wrist crops and `nearest-exact` (floor((j+0.5)*s))
+                # would take that bias to 0.000.
+                # Changing the mode would mean retraining every checkpoint.
+                # cam_high is unaffected either way: its depth grid equals its slot.
                 xyz = F.interpolate(xyz, size=(H_dst, W_dst), mode="nearest")
             # [B*F, 3, H, W] → [B*F, 3, 1, H, W] for the 5D compose API.
             per_cam_5d[cam_names[cam_idx]] = xyz.unsqueeze(2)

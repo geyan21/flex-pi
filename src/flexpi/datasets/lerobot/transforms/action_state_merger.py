@@ -123,12 +123,24 @@ class ScatterToChannels:
             assert min(self.used_state_channel_ids) >= 0
 
     def forward(self, batch):
+        # A per-SAMPLE pad mask set by an upstream transform (mixed-embodiment
+        # corpora: AlignTo34DByWidth marks a 32-wide sample's absent 7th-joint
+        # slots) is OR-ed into this merger's static per-CONFIG mask instead of
+        # being clobbered. Configs without such a transform see no change.
         if "action" in batch:
             x = ConcatLeftAlign._concat(batch["action"], self.action_meta)
-            batch["action"], batch["action_dim_is_pad"] = self._scatter(x, self.used_action_channel_ids)
+            prior = batch.get("action_dim_is_pad", None)
+            batch["action"], mask = self._scatter(x, self.used_action_channel_ids)
+            if prior is not None:
+                mask = mask | prior.to(device=mask.device, dtype=torch.bool)
+            batch["action_dim_is_pad"] = mask
 
         x = ConcatLeftAlign._concat(batch["state"], self.state_meta)
-        batch["state"], batch["state_dim_is_pad"] = self._scatter(x, self.used_state_channel_ids)
+        prior = batch.get("state_dim_is_pad", None)
+        batch["state"], mask = self._scatter(x, self.used_state_channel_ids)
+        if prior is not None:
+            mask = mask | prior.to(device=mask.device, dtype=torch.bool)
+        batch["state_dim_is_pad"] = mask
 
         return batch
 
