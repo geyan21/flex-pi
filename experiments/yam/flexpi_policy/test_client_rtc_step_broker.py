@@ -10,9 +10,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pytest
 
-# Import the broker module DIRECTLY by path so we don't trigger the
-# `experiments.yam.flexpi_policy` package __init__ (which loads the whole
-# model). This makes the test runnable in any python env with numpy + pytest.
+# Import the broker module DIRECTLY by path, so this test never depends on the
+# `experiments.yam.flexpi_policy` package __init__. Note that pytest imports the
+# parent package during collection regardless of this, so what actually keeps
+# the test runnable in any python env with numpy + pytest is that the __init__
+# resolves its heavy re-exports lazily.
 _BROKER_PATH = (
     Path(__file__).resolve().parent / "client_rtc_step_broker.py"
 )

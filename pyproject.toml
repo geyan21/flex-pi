@@ -108,3 +108,11 @@ trt = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["flexpi*"]
+
+[tool.pytest.ini_options]
+# Drop pytest's default `*_test.py` half of the glob. The only file it matches
+# is experiments/yam/flexpi_policy/smoke_test.py, which is a checkpoint-driven
+# CLI entrypoint rather than a test module, so `pytest experiments -q`
+# (docs/INSTALL.md section 3) would otherwise fail at collection trying to
+# import it.
+python_files = ["test_*.py"]
